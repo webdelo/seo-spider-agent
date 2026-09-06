@@ -13,11 +13,14 @@ struct AIAuditFinding: Identifiable, Hashable, Sendable, Codable {
 struct AIAuditReport: Sendable {
     var siteURL: String
     var generatedAt: Date
+    var backlinkAnalysis: String
+    var technicalAnalysis: String
+    var searchConsoleAnalysis: String
+    var executiveSummary: String
+    var findings: [AIAuditFinding]
     var crawlSummary: AIAuditCrawlSummary
     var backlinkSummary: AIAuditBacklinkSummary
     var searchConsoleSummary: AIAuditSearchConsoleSummary
-    var findings: [AIAuditFinding]
-    var overallAssessment: String
 }
 
 struct AIAuditCrawlSummary: Sendable, Codable {

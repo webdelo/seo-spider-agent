@@ -1049,8 +1049,6 @@ private struct FlowLayout: Layout {
 struct AuditView: View {
     @ObservedObject var model: CrawlViewModel
     @State private var enlargedScreenshot: VisualAuditResult?
-    @State private var auditType = AuditType.technical
-    private enum AuditType: String, CaseIterable, Identifiable { case technical = "Technical Audit", ai = "AI Audit"; var id: String { rawValue } }
     var body: some View {
         AnyView(auditContent)
     }
@@ -1058,21 +1056,17 @@ struct AuditView: View {
     private var auditContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Picker("Audit type", selection: $auditType) {
-                    ForEach(AuditType.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 310)
                 HStack {
                     VStack(alignment: .leading) {
-                        Text(auditType.rawValue).font(.title2.weight(.semibold))
-                        Text(auditType == .technical ? "Client-ready assessment of site setup, analytics and system duplicates." : "AI-assisted analysis of crawl, backlink and Search Console data.").foregroundStyle(.secondary)
+                        Text("Audit").font(.title2.weight(.semibold))
+                        Text("Technical audit and AI-assisted analysis of crawl, backlink and Search Console data.").foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button(auditType == .technical ? (model.auditRunning ? "Auditing…" : "Run Audit") : (model.aiAuditRunning ? "Running AI Audit…" : "Run AI Audit")) { if auditType == .technical { model.runAudit() } else { model.runAIAudit() } }.buttonStyle(.borderedProminent).disabled(auditType == .technical ? model.auditRunning || model.records.isEmpty : model.aiAuditRunning || model.records.isEmpty)
+                    Button(model.auditRunning ? "Auditing…" : "Run Audit") { model.runAudit() }.buttonStyle(.borderedProminent).disabled(model.auditRunning || model.records.isEmpty)
+                    Button(model.aiAuditRunning ? "Running AI Audit…" : "AI Helper") { model.runAIAudit() }.buttonStyle(.borderedProminent).disabled(model.aiAuditRunning || model.records.isEmpty)
                     Button("Reset results", role: .destructive) { model.resetAuditAndCrawl() }
                         .disabled(model.auditRunning || model.aiAuditRunning || model.visualAuditRunning || model.pageSpeedRunning)
-                    if auditType == .technical, let report = model.auditReport {
+                    if let report = model.auditReport {
                         Button("Export client PDF") {
                             _ = ClientPDFReport.export(report: report, records: model.records, issues: model.issues, approvedVisualIDs: model.approvedVisualIssueIDs, startURL: model.startText)
                         }.disabled(model.auditRunning)
@@ -1095,13 +1089,12 @@ struct AuditView: View {
                         .help("Save a developer / SEO specialist task brief. The main button exports High + Medium tasks; the arrow selects another priority.")
                         .disabled(model.auditRunning || model.records.isEmpty)
                     }
-                    if auditType == .ai, model.aiAuditReport != nil {
+                    if model.aiAuditReport != nil {
                         Button("Export AI Audit PDF") { model.exportAIAuditPDF() }.disabled(model.aiAuditRunning)
                     }
                 }
-                if auditType == .ai {
-                    aiAuditResults
-                } else if let report = model.auditReport {
+                aiAuditResults
+                if let report = model.auditReport {
                     GroupBox("Domain profile") {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack { Text("Ahrefs Domain Rating").fontWeight(.semibold); Spacer(); if let dr = report.siteProfile.domainRating { Text(String(format: "%.1f / 100", dr)).font(.title3.weight(.bold)) } else { Text("Unavailable").foregroundStyle(.orange) } }
@@ -1311,12 +1304,16 @@ struct AuditView: View {
     private var aiAuditResults: some View {
         if model.aiAuditRunning { HStack(spacing: 8) { ProgressView(); Text("Aggregating data and preparing the AI audit…").foregroundStyle(.secondary) }.padding() }
         if let report = model.aiAuditReport {
-            GroupBox("Executive assessment") { Text(report.overallAssessment).frame(maxWidth: .infinity, alignment: .leading) }
+            GroupBox("Executive summary") { Text(report.executiveSummary).fontWeight(.bold).frame(maxWidth: .infinity, alignment: .leading) }
             HStack(spacing: 10) {
                 AIAuditSummaryCard(title: "Crawl", detail: "\(report.crawlSummary.totalURLs) URLs · \(report.crawlSummary.errorCount) errors\n\(report.crawlSummary.missingTitles) missing titles")
                 AIAuditSummaryCard(title: "Backlinks", detail: "DR \(report.backlinkSummary.domainRank) · \(report.backlinkSummary.totalBacklinks) links\n\(report.backlinkSummary.referringDomains) referring domains")
                 AIAuditSummaryCard(title: "Search Console", detail: report.searchConsoleSummary.available ? "\(report.searchConsoleSummary.indexedPages) indexed · \(report.searchConsoleSummary.notIndexedPages) not indexed\n\(report.searchConsoleSummary.clicks7d) clicks · \(report.searchConsoleSummary.impressions7d) impressions" : "Unavailable\n\(report.searchConsoleSummary.unavailableReason)")
             }
+            GroupBox("Анализ ссылочного профиля") { Text(report.backlinkAnalysis).frame(maxWidth: .infinity, alignment: .leading) }
+            GroupBox("Технические ошибки") { Text(report.technicalAnalysis).frame(maxWidth: .infinity, alignment: .leading) }
+            GroupBox("Ошибки Search Console") { Text(report.searchConsoleAnalysis).frame(maxWidth: .infinity, alignment: .leading) }
+            if !report.findings.isEmpty { Text("Findings").font(.title3.weight(.semibold)) }
             ForEach(report.findings) { finding in
                 GroupBox {
                     VStack(alignment: .leading, spacing: 6) {
@@ -1327,7 +1324,7 @@ struct AuditView: View {
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-        } else if !model.aiAuditRunning { ContentUnavailableView("Run AI Audit", systemImage: "sparkles", description: Text("First crawl the site, then run an AI audit. It remains useful without an API key using its built-in fallback.")) }
+        } else if !model.aiAuditRunning { ContentUnavailableView("Use AI Helper", systemImage: "sparkles", description: Text("First crawl the site, then run the AI audit. It remains useful without an API key using its built-in fallback.")) }
     }
     @ViewBuilder
     private func gscExamples(_ title: String, _ records: [CrawlRecord], detail: @escaping (CrawlRecord) -> String) -> some View {

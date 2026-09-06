@@ -25,8 +25,11 @@ private final class AIAuditPDFRenderer {
         paragraph("Client-ready analysis of crawl, backlink and Search Console data.", font: .systemFont(ofSize: 15, weight: .medium), color: ink)
         paragraph(report.siteURL, font: .systemFont(ofSize: 13, weight: .semibold), color: purple)
         paragraph("Generated \(report.generatedAt.formatted(date: .long, time: .shortened))", font: .systemFont(ofSize: 10.5), color: muted, spacing: 16)
-        section("Executive summary"); paragraph(report.overallAssessment, color: ink)
+        section("Executive summary"); paragraph(report.executiveSummary, font: .systemFont(ofSize: 11, weight: .semibold), color: ink)
         section("Data source summary"); summaryCards()
+        section("Анализ ссылочного профиля"); paragraph(report.backlinkAnalysis, color: ink)
+        section("Технические ошибки"); paragraph(report.technicalAnalysis, color: ink)
+        section("Ошибки Search Console"); paragraph(report.searchConsoleAnalysis, color: ink)
         section("Prioritized findings")
         if report.findings.isEmpty { paragraph("No high- or medium-priority findings were generated from the available data.", color: muted) }
         for finding in report.findings.sorted(by: { weight($0.severity) > weight($1.severity) }) { findingCard(finding) }
@@ -56,7 +59,19 @@ private final class AIAuditPDFRenderer {
         if !urls.isEmpty { draw(urls, x: margin + 14, y: cursor, width: width, font: .monospacedSystemFont(ofSize: 8, weight: .regular), color: muted); cursor -= height(urls, width: width, font: .monospacedSystemFont(ofSize: 8, weight: .regular)) + 4 }
         draw(recommendation, x: margin + 14, y: cursor, width: width, font: .systemFont(ofSize: 9.5, weight: .medium), color: ink); y -= boxHeight + 9
     }
-    private func paragraph(_ text: String, font: NSFont = .systemFont(ofSize: 10.5), color: NSColor, spacing: CGFloat = 7) { let h = height(text, width: page.width - margin * 2, font: font); ensure(h + spacing); draw(text, x: margin, y: y - h, width: page.width - margin * 2, font: font, color: color); y -= h + spacing }
+    private func paragraph(_ text: String, font: NSFont = .systemFont(ofSize: 10.5), color: NSColor, spacing: CGFloat = 7) {
+        var wrapped = lines(text, width: page.width - margin * 2, font: font)
+        while !wrapped.isEmpty {
+            let capacity = max(1, Int((y - margin - 28) / lineHeight(font)))
+            let chunk = Array(wrapped.prefix(capacity))
+            let rendered = chunk.joined(separator: "\n"), h = height(rendered, width: page.width - margin * 2, font: font)
+            ensure(h + spacing)
+            draw(rendered, x: margin, y: y - h, width: page.width - margin * 2, font: font, color: color)
+            y -= h
+            wrapped.removeFirst(chunk.count)
+            if !wrapped.isEmpty { footer(); beginPage() } else { y -= spacing }
+        }
+    }
     private func draw(_ text: String, x: CGFloat, y: CGFloat, width: CGFloat, font: NSFont, color: NSColor) { var baseline = y; context.saveGState(); context.textMatrix = .identity; for lineText in lines(text, width: width, font: font) { let line = CTLineCreateWithAttributedString(NSAttributedString(string: lineText, attributes: [.font: font, .foregroundColor: color])); var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0; CTLineGetTypographicBounds(line, &ascent, &descent, &leading); baseline -= ascent; context.textPosition = CGPoint(x: x, y: baseline); CTLineDraw(line, context); baseline -= descent + leading + max(2, font.pointSize * 0.16) }; context.restoreGState() }
     private func height(_ text: String, width: CGFloat, font: NSFont) -> CGFloat { CGFloat(lines(text, width: width, font: font).count) * lineHeight(font) }
     private func lineHeight(_ font: NSFont) -> CGFloat { ceil(font.ascender - font.descender + font.leading + max(2, font.pointSize * 0.16)) }

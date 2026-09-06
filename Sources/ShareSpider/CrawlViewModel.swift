@@ -637,7 +637,7 @@ final class CrawlViewModel: ObservableObject {
         guard !aiAuditRunning, !records.isEmpty else { return }
         aiAuditRunning = true
         let startURL = startText
-        let data = AIAuditCollector.collect(records: records, auditReport: auditReport, backlinkReport: backlinkReport, startURL: startURL)
+        let data = AIAuditCollector.collect(records: records, issues: issues, auditReport: auditReport, backlinkReport: backlinkReport, referringDomainDetails: referringDomainDetails, backlinkSourceDetails: backlinkSourceDetails)
         Task { [weak self] in
             let report = await AIAuditAnalyzer.analyze(data: data, startURL: startURL)
             guard !Task.isCancelled else { return }

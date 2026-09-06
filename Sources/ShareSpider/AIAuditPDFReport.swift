@@ -36,6 +36,15 @@ private final class AIAuditPDFRenderer {
         section("Prioritized findings")
         if report.findings.isEmpty { paragraph("No high- or medium-priority findings were generated from the available data.", color: muted) }
         for finding in report.findings.sorted(by: { weight($0.severity) > weight($1.severity) }) { findingCard(finding) }
+        section("Verified summary")
+        paragraph(report.verifiedSummary.isEmpty ? "No verified summary was generated." : report.verifiedSummary, font: .systemFont(ofSize: 11, weight: .semibold), color: ink)
+        section("Codex Deep Analysis · \(report.customAnalyses.count)")
+        if report.confirmedFindings.isEmpty { paragraph("No custom analyses were generated.", color: muted) }
+        for analysis in report.confirmedFindings { customAnalysisCard(analysis) }
+        if !report.rejectedFindings.isEmpty {
+            section("Rejected findings (appendix)")
+            for analysis in report.rejectedFindings { customAnalysisCard(analysis) }
+        }
         footer(); context.endPDFPage(); context.closePDF(); return true
     }
 
@@ -61,6 +70,20 @@ private final class AIAuditPDFRenderer {
         draw(finding.summary, x: margin + 14, y: cursor, width: width, font: .systemFont(ofSize: 10), color: muted); cursor -= height(finding.summary, width: width, font: .systemFont(ofSize: 10)) + 4
         if !urls.isEmpty { draw(urls, x: margin + 14, y: cursor, width: width, font: .monospacedSystemFont(ofSize: 8, weight: .regular), color: muted); cursor -= height(urls, width: width, font: .monospacedSystemFont(ofSize: 8, weight: .regular)) + 4 }
         draw(recommendation, x: margin + 14, y: cursor, width: width, font: .systemFont(ofSize: 9.5, weight: .medium), color: ink); y -= boxHeight + 9
+    }
+    private func customAnalysisCard(_ analysis: AICodexAnalyst.CustomAnalysis) {
+        let title = "\(analysis.status) · \(analysis.confidence) · \(analysis.question)"
+        let body = "Reason: \(analysis.reasonForAnalysis)\nConclusion: \(analysis.finalConclusion)\nModel: \(analysis.modelUsed)\nVerification: \(analysis.codexVerification)"
+        let width = page.width - margin * 2 - 28
+        let titleFont = NSFont.systemFont(ofSize: 11, weight: .bold), bodyFont = NSFont.systemFont(ofSize: 9.5)
+        let boxHeight = height(title, width: width, font: titleFont) + height(body, width: width, font: bodyFont) + 38
+        ensure(boxHeight + 10); let top = y
+        context.setFillColor(NSColor(calibratedWhite: 0.975, alpha: 1).cgColor); context.fill(CGRect(x: margin, y: top - boxHeight, width: page.width - margin * 2, height: boxHeight))
+        context.setFillColor(statusColor(analysis.status).cgColor); context.fill(CGRect(x: margin, y: top - boxHeight, width: 5, height: boxHeight))
+        var cursor = top - 15
+        draw(title, x: margin + 14, y: cursor, width: width, font: titleFont, color: statusColor(analysis.status)); cursor -= height(title, width: width, font: titleFont) + 5
+        draw(body, x: margin + 14, y: cursor, width: width, font: bodyFont, color: muted)
+        y -= boxHeight + 9
     }
     private func backlinkDetails() -> String {
         let detail = report.backlinkProfileDetail
@@ -105,4 +128,5 @@ private final class AIAuditPDFRenderer {
     private func footer() { draw("ShareSpider · AI SEO Audit · Page \(pageNumber)", x: margin, y: 23, width: page.width - margin * 2, font: .systemFont(ofSize: 8.5), color: muted) }
     private func weight(_ value: String) -> Int { value == "High" ? 3 : value == "Medium" ? 2 : 1 }
     private func color(_ severity: String) -> NSColor { severity == "High" ? .systemRed : severity == "Medium" ? .systemOrange : purple }
+    private func statusColor(_ status: String) -> NSColor { switch status { case "Confirmed": .systemGreen; case "Partially confirmed": .systemOrange; case "Rejected": .systemRed; default: muted } }
 }

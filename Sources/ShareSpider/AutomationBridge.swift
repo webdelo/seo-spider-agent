@@ -18,6 +18,15 @@ enum AutomationBridge {
     static var pendingGSCBacklinkExportURL: URL { directory.appendingPathComponent("pending-gsc-backlinks.csv") }
     static var pendingGSCSiteReportURL: URL { directory.appendingPathComponent("pending-gsc-site-report.csv") }
     static var performanceLogURL: URL { directory.appendingPathComponent("performance-log.jsonl") }
+    static var pendingAIAuditContextURL: URL { directory.appendingPathComponent("pending-ai-audit-context.json") }
+    static var aiAuditResultURL: URL { directory.appendingPathComponent("ai-audit-result.json") }
+
+    static func writeAIAuditContext(_ data: Data) { try? data.write(to: pendingAIAuditContextURL, options: .atomic) }
+    static func consumeAIAuditResult() -> Data? {
+        guard let data = try? Data(contentsOf: aiAuditResultURL) else { return nil }
+        try? FileManager.default.removeItem(at: aiAuditResultURL)
+        return data
+    }
 
     static func consumePendingProjectImport() -> String? {
         guard let value = try? String(contentsOf: pendingProjectImportURL), !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }

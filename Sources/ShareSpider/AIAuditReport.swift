@@ -28,6 +28,10 @@ struct AIAuditReport: Sendable {
     var backlinkProfileDetail: AIAuditBacklinkBlock
     var technicalIssuesDetail: AIAuditTechnicalBlock
     var searchConsoleErrorsDetail: AIAuditSearchConsoleBlock
+    var customAnalyses: [AICodexAnalyst.CustomAnalysis] = []
+    var verifiedSummary: String = ""
+    var rejectedFindings: [AICodexAnalyst.CustomAnalysis] { customAnalyses.filter { $0.status == "Rejected" } }
+    var confirmedFindings: [AICodexAnalyst.CustomAnalysis] { customAnalyses.filter { $0.status == "Confirmed" || $0.status == "Partially confirmed" } }
 }
 
 struct AIAuditCrawlSummary: Sendable, Codable {

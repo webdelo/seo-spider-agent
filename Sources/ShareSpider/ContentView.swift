@@ -1308,6 +1308,8 @@ struct AuditView: View {
                 stageRow("Link Profile Analysis", stage: .linkAnalysis)
                 stageRow("Technical SEO Analysis", stage: .technicalAnalysis)
                 stageRow("GSC Analysis", stage: .gscAnalysis)
+                stageRow("Codex Deep Analysis", stage: .codexAnalysis)
+                stageRow("Verification", stage: .verification)
                 stageRow("Executive Summary", stage: .executiveSummary)
             }.padding()
         }
@@ -1332,6 +1334,32 @@ struct AuditView: View {
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+            Text("Codex Deep Analysis · \(report.customAnalyses.count) custom analyses").font(.title3.weight(.semibold))
+            if report.customAnalyses.isEmpty {
+                Text("No custom analyses were generated. The audit data did not reveal anomalies requiring deeper investigation.").foregroundStyle(.secondary)
+            }
+            ForEach(report.confirmedFindings) { analysis in
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(analysis.status).font(.caption.weight(.bold)).foregroundStyle(analysis.status == "Confirmed" ? .green : .orange)
+                        Text(analysis.question).font(.headline)
+                        Text(analysis.finalConclusion).frame(maxWidth: .infinity, alignment: .leading)
+                        Text("Confidence: \(analysis.confidence) · Model: \(analysis.modelUsed)").font(.caption).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if !report.rejectedFindings.isEmpty {
+                Text("Rejected findings").font(.headline)
+                ForEach(report.rejectedFindings) { analysis in
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(analysis.question).font(.headline)
+                            Text(analysis.codexVerification).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            if !report.verifiedSummary.isEmpty { GroupBox("Verified Summary") { Text(report.verifiedSummary).fontWeight(.bold).frame(maxWidth: .infinity, alignment: .leading) } }
         } else if !model.aiAuditRunning { ContentUnavailableView("Use AI Helper", systemImage: "sparkles", description: Text("First crawl the site, then run the AI audit. It remains useful without an API key using its built-in fallback.")) }
     }
     @ViewBuilder
@@ -1346,10 +1374,10 @@ struct AuditView: View {
         }
     }
     private func stageOrderIndex(_ stage: AIAuditStage) -> Int {
-        switch stage { case .notStarted, .collectingData: 0; case .linkAnalysis: 1; case .technicalAnalysis: 2; case .gscAnalysis: 3; case .codexAnalysis, .verification, .executiveSummary: 4; case .complete: 5 }
+        switch stage { case .notStarted, .collectingData: 0; case .linkAnalysis: 1; case .technicalAnalysis: 2; case .gscAnalysis: 3; case .codexAnalysis: 4; case .verification: 5; case .executiveSummary: 6; case .complete: 7 }
     }
     private func stageLabel(_ stage: AIAuditStage) -> String {
-        switch stage { case .collectingData: "Collecting audit data…"; case .linkAnalysis: "Analyzing link profile…"; case .technicalAnalysis: "Analyzing technical SEO…"; case .gscAnalysis: "Analyzing Search Console…"; case .executiveSummary: "Writing executive summary…"; case .complete: "AI audit complete"; default: "Preparing AI audit…" }
+        switch stage { case .collectingData: "Collecting audit data…"; case .linkAnalysis: "Analyzing link profile…"; case .technicalAnalysis: "Analyzing technical SEO…"; case .gscAnalysis: "Analyzing Search Console…"; case .codexAnalysis: "Running Codex deep analysis…"; case .verification: "Verifying findings…"; case .executiveSummary: "Writing executive summary…"; case .complete: "AI audit complete"; default: "Preparing AI audit…" }
     }
     @ViewBuilder
     private func gscExamples(_ title: String, _ records: [CrawlRecord], detail: @escaping (CrawlRecord) -> String) -> some View {

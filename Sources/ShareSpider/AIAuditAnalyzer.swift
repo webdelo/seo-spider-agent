@@ -2,7 +2,7 @@ import Foundation
 
 @MainActor
 enum AIAuditAnalyzer {
-    static func analyze(data: AIAuditReportData, startURL: String, onStage: ((AIAuditStage) -> Void)? = nil) async -> AIAuditReport {
+    static func analyze(data: AIAuditReportData, startURL: String, records: [CrawlRecord], overview: [OverviewItem], issues: [Issue], referringDomainDetails: [ReferringDomainDetail], backlinkSourceDetails: [BacklinkSourceDetail], onStage: ((AIAuditStage) -> Void)? = nil) async -> AIAuditReport {
         guard let key = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"], !key.isEmpty else { onStage?(.complete); return fallback(data: data, startURL: startURL, reason: "AI-анализ недоступен: OPENROUTER_API_KEY не настроен.") }
         onStage?(.linkAnalysis)
         let backlink = await analysis(for: data.backlinkProfile, key: key, instruction: "Проанализируй ссылочный профиль сайта: сильные стороны, риски и приоритеты. Используй только переданные цифры и URL.", fallback: "Анализ ссылочного профиля через OpenRouter не выполнен; используйте структурированные данные отчёта.")
@@ -12,8 +12,15 @@ enum AIAuditAnalyzer {
         let gsc = await analysis(for: data.searchConsoleErrors, key: key, instruction: "Проанализируй ошибки Google Search Console и связанные сведения краула. Опирайся только на переданные данные.", fallback: "AI-анализ Search Console не выполнен; используйте структурированные данные отчёта.")
         onStage?(.executiveSummary)
         let summary = await executiveSummary(backlink: backlink, technical: technical, gsc: gsc, key: key)
+        onStage?(.codexAnalysis)
+        let context = AuditContext.form(siteURL: startURL, records: records, overview: overview, issues: issues, backlinkSummary: data.backlinkSummary, referringDomainDetails: referringDomainDetails, backlinkSourceDetails: backlinkSourceDetails, gscSummary: data.searchConsoleSummary, gscErrorCategories: data.searchConsoleErrors.errors, backlinkAnalysis: backlink, technicalAnalysis: technical, searchConsoleAnalysis: gsc, crawlSummary: data.crawlSummary)
+        if let encoded = try? JSONEncoder().encode(context) { AutomationBridge.writeAIAuditContext(encoded) }
+        onStage?(.verification)
+        let custom = await AICodexAnalyst.analyze(context: context) { _, _ in }
+        onStage?(.executiveSummary)
+        let verified = await verifiedSummary(backlink: backlink, technical: technical, gsc: gsc, analyses: custom, key: key)
         onStage?(.complete)
-        return makeReport(data: data, startURL: startURL, backlink: backlink, technical: technical, gsc: gsc, summary: summary)
+        return makeReport(data: data, startURL: startURL, backlink: backlink, technical: technical, gsc: gsc, summary: summary, customAnalyses: custom, verifiedSummary: verified)
     }
 
     private static func analysis<T: Encodable>(for block: T, key: String, instruction: String, fallback: String) async -> String {
@@ -21,6 +28,12 @@ enum AIAuditAnalyzer {
     }
     private static func executiveSummary(backlink: String, technical: String, gsc: String, key: String) async -> String {
         do { return try await request(key: key, system: "Ты эксперт по SEO-аудитам. Напиши один краткий абзац на русском с executive summary, объединяющий три переданных анализа. Не добавляй фактов, которых в них нет.", user: "Ссылочный профиль:\n\(backlink)\n\nТехнический анализ:\n\(technical)\n\nSearch Console:\n\(gsc)") } catch { return "AI-итог не сформирован. Приоритеты определены по данным ссылочного профиля, технического краула и Search Console." }
+    }
+    private static func verifiedSummary(backlink: String, technical: String, gsc: String, analyses: [AICodexAnalyst.CustomAnalysis], key: String) async -> String {
+        let confirmed = analyses.filter { $0.status == "Confirmed" || $0.status == "Partially confirmed" }
+        let rejected = analyses.filter { $0.status == "Rejected" }
+        let user = "Fixed analyses:\n\(backlink)\n\n\(technical)\n\n\(gsc)\n\nConfirmed findings:\n\(confirmed.map { "• \($0.question): \($0.finalConclusion)" }.joined(separator: "\n"))\n\nRejected findings (do not state as facts):\n\(rejected.map(\.question).joined(separator: "\n"))"
+        do { return try await request(key: key, system: "You are an SEO analyst. Based on the verified findings below, provide a 3-5 point verified summary with key findings, systemic problems, likely causes, fix priorities, and what is confirmed by facts versus probable interpretation. Respond in Russian. Do not present rejected findings as facts.", user: user) } catch { return "Проверенный итог не сформирован. Используйте подтверждённые выводы Codex Deep Analysis вместе с базовыми разделами аудита." }
     }
     private static func request(key: String, system: String, user: String) async throws -> String {
         var request = URLRequest(url: URL(string: "https://openrouter.ai/api/v1/chat/completions")!)
@@ -32,8 +45,8 @@ enum AIAuditAnalyzer {
         guard let content = try JSONDecoder().decode(ChatResponse.self, from: body).choices.first?.message.content?.trimmingCharacters(in: .whitespacesAndNewlines), !content.isEmpty else { throw AnalysisError.emptyResponse }
         return content
     }
-    private static func makeReport(data: AIAuditReportData, startURL: String, backlink: String, technical: String, gsc: String, summary: String) -> AIAuditReport {
-        AIAuditReport(siteURL: startURL, generatedAt: Date(), backlinkAnalysis: backlink, technicalAnalysis: technical, searchConsoleAnalysis: gsc, executiveSummary: summary, findings: fixedFindings(data), crawlSummary: data.crawlSummary, backlinkSummary: data.backlinkSummary, searchConsoleSummary: data.searchConsoleSummary, backlinkProfileDetail: data.backlinkProfile, technicalIssuesDetail: data.technicalErrors, searchConsoleErrorsDetail: data.searchConsoleErrors)
+    private static func makeReport(data: AIAuditReportData, startURL: String, backlink: String, technical: String, gsc: String, summary: String, customAnalyses: [AICodexAnalyst.CustomAnalysis] = [], verifiedSummary: String = "") -> AIAuditReport {
+        AIAuditReport(siteURL: startURL, generatedAt: Date(), backlinkAnalysis: backlink, technicalAnalysis: technical, searchConsoleAnalysis: gsc, executiveSummary: summary, findings: fixedFindings(data), crawlSummary: data.crawlSummary, backlinkSummary: data.backlinkSummary, searchConsoleSummary: data.searchConsoleSummary, backlinkProfileDetail: data.backlinkProfile, technicalIssuesDetail: data.technicalErrors, searchConsoleErrorsDetail: data.searchConsoleErrors, customAnalyses: customAnalyses, verifiedSummary: verifiedSummary)
     }
     private static func fixedFindings(_ data: AIAuditReportData) -> [AIAuditFinding] {
         var findings = data.technicalErrors.issues.prefix(8).map { AIAuditFinding(title: $0.name, severity: severity($0.priority), category: $0.type, summary: "Затронуто URL: \($0.count) (\(String(format: "%.1f", $0.percentage))%).", affectedURLs: $0.examples, recommendation: "Проверьте примеры URL и устраните указанную техническую проблему.") }

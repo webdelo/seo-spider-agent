@@ -1302,7 +1302,15 @@ struct AuditView: View {
     }
     @ViewBuilder
     private var aiAuditResults: some View {
-        if model.aiAuditRunning { HStack(spacing: 8) { ProgressView(); Text("Aggregating data and preparing the AI audit…").foregroundStyle(.secondary) }.padding() }
+        if model.aiAuditRunning {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) { ProgressView(); Text(stageLabel(model.aiAuditStage)).foregroundStyle(.secondary) }
+                stageRow("Link Profile Analysis", stage: .linkAnalysis)
+                stageRow("Technical SEO Analysis", stage: .technicalAnalysis)
+                stageRow("GSC Analysis", stage: .gscAnalysis)
+                stageRow("Executive Summary", stage: .executiveSummary)
+            }.padding()
+        }
         if let report = model.aiAuditReport {
             GroupBox("Executive summary") { Text(report.executiveSummary).fontWeight(.bold).frame(maxWidth: .infinity, alignment: .leading) }
             HStack(spacing: 10) {
@@ -1325,6 +1333,23 @@ struct AuditView: View {
                 }
             }
         } else if !model.aiAuditRunning { ContentUnavailableView("Use AI Helper", systemImage: "sparkles", description: Text("First crawl the site, then run the AI audit. It remains useful without an API key using its built-in fallback.")) }
+    }
+    @ViewBuilder
+    private func stageRow(_ title: String, stage: AIAuditStage) -> some View {
+        let current = model.aiAuditStage == stage
+        let done = stageOrderIndex(model.aiAuditStage) > stageOrderIndex(stage)
+        HStack(spacing: 8) {
+            if done { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+            else if current { ProgressView().controlSize(.small) }
+            else { Image(systemName: "circle").foregroundStyle(.tertiary) }
+            Text(title).foregroundStyle(current ? .primary : .secondary)
+        }
+    }
+    private func stageOrderIndex(_ stage: AIAuditStage) -> Int {
+        switch stage { case .notStarted, .collectingData: 0; case .linkAnalysis: 1; case .technicalAnalysis: 2; case .gscAnalysis: 3; case .codexAnalysis, .verification, .executiveSummary: 4; case .complete: 5 }
+    }
+    private func stageLabel(_ stage: AIAuditStage) -> String {
+        switch stage { case .collectingData: "Collecting audit data…"; case .linkAnalysis: "Analyzing link profile…"; case .technicalAnalysis: "Analyzing technical SEO…"; case .gscAnalysis: "Analyzing Search Console…"; case .executiveSummary: "Writing executive summary…"; case .complete: "AI audit complete"; default: "Preparing AI audit…" }
     }
     @ViewBuilder
     private func gscExamples(_ title: String, _ records: [CrawlRecord], detail: @escaping (CrawlRecord) -> String) -> some View {

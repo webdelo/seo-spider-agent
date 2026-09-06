@@ -1,5 +1,9 @@
 import Foundation
 
+enum AIAuditStage: String, Sendable {
+    case notStarted, collectingData, linkAnalysis, technicalAnalysis, gscAnalysis, codexAnalysis, verification, executiveSummary, complete
+}
+
 struct AIAuditFinding: Identifiable, Hashable, Sendable, Codable {
     var id: UUID = UUID()
     var title: String
@@ -21,6 +25,9 @@ struct AIAuditReport: Sendable {
     var crawlSummary: AIAuditCrawlSummary
     var backlinkSummary: AIAuditBacklinkSummary
     var searchConsoleSummary: AIAuditSearchConsoleSummary
+    var backlinkProfileDetail: AIAuditBacklinkBlock
+    var technicalIssuesDetail: AIAuditTechnicalBlock
+    var searchConsoleErrorsDetail: AIAuditSearchConsoleBlock
 }
 
 struct AIAuditCrawlSummary: Sendable, Codable {

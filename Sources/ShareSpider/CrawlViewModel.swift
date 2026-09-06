@@ -34,6 +34,7 @@ final class CrawlViewModel: ObservableObject {
     @Published private(set) var auditReport: AuditReport?
     @Published private(set) var auditRunning = false
     @Published private(set) var aiAuditRunning = false
+    @Published private(set) var aiAuditStage: AIAuditStage = .notStarted
     @Published private(set) var aiAuditReport: AIAuditReport?
     @Published private(set) var pageSpeedResults: [PageSpeedResult] = []
     @Published private(set) var pageSpeedRunning = false
@@ -235,7 +236,7 @@ final class CrawlViewModel: ObservableObject {
     func resetAuditAndCrawl() {
         stop()
         resetCrawlResults()
-        auditReport = nil; aiAuditReport = nil; pageSpeedResults = []; visualAuditResults = []
+        auditReport = nil; aiAuditReport = nil; aiAuditStage = .notStarted; pageSpeedResults = []; visualAuditResults = []
         approvedVisualIssueIDs = []; auditRunning = false; aiAuditRunning = false; pageSpeedRunning = false
         visualAuditRunning = false; visualAuditProgress = nil; visualAuditor = nil
         state = .idle; startedAt = nil; queued = 0
@@ -356,7 +357,7 @@ final class CrawlViewModel: ObservableObject {
         recordIndexByURL.removeAll(keepingCapacity: false)
         inlinkCounts.removeAll(keepingCapacity: false)
         records = []; issues = []; overview = []; cachedErrors = 0
-        aiAuditReport = nil; aiAuditRunning = false
+        aiAuditReport = nil; aiAuditRunning = false; aiAuditStage = .notStarted
         backlinkReport = nil; backlinkProgress = 0; backlinkTotal = 0; backlinkMessage = ""
         backlinkSourceDetails = []; backlinkHistory = []; referringDomainDetails = []
         overviewSelectionName = nil; overviewSelectionIDs = []; issueSelection = nil
@@ -636,10 +637,13 @@ final class CrawlViewModel: ObservableObject {
     func runAIAudit() {
         guard !aiAuditRunning, !records.isEmpty else { return }
         aiAuditRunning = true
+        aiAuditStage = .collectingData
         let startURL = startText
         let data = AIAuditCollector.collect(records: records, issues: issues, auditReport: auditReport, backlinkReport: backlinkReport, referringDomainDetails: referringDomainDetails, backlinkSourceDetails: backlinkSourceDetails)
         Task { [weak self] in
-            let report = await AIAuditAnalyzer.analyze(data: data, startURL: startURL)
+            let report = await AIAuditAnalyzer.analyze(data: data, startURL: startURL) { stage in
+                self?.aiAuditStage = stage
+            }
             guard !Task.isCancelled else { return }
             self?.aiAuditReport = report
             self?.aiAuditRunning = false

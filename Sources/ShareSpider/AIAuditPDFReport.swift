@@ -28,8 +28,11 @@ private final class AIAuditPDFRenderer {
         section("Executive summary"); paragraph(report.executiveSummary, font: .systemFont(ofSize: 11, weight: .semibold), color: ink)
         section("Data source summary"); summaryCards()
         section("Анализ ссылочного профиля"); paragraph(report.backlinkAnalysis, color: ink)
+        section("Детали ссылочного профиля"); paragraph(backlinkDetails(), font: .systemFont(ofSize: 9), color: muted)
         section("Технические ошибки"); paragraph(report.technicalAnalysis, color: ink)
+        section("Детали технических проблем"); paragraph(technicalDetails(), font: .systemFont(ofSize: 9), color: muted)
         section("Ошибки Search Console"); paragraph(report.searchConsoleAnalysis, color: ink)
+        section("Детали ошибок Search Console"); paragraph(gscDetails(), font: .systemFont(ofSize: 9), color: muted)
         section("Prioritized findings")
         if report.findings.isEmpty { paragraph("No high- or medium-priority findings were generated from the available data.", color: muted) }
         for finding in report.findings.sorted(by: { weight($0.severity) > weight($1.severity) }) { findingCard(finding) }
@@ -58,6 +61,29 @@ private final class AIAuditPDFRenderer {
         draw(finding.summary, x: margin + 14, y: cursor, width: width, font: .systemFont(ofSize: 10), color: muted); cursor -= height(finding.summary, width: width, font: .systemFont(ofSize: 10)) + 4
         if !urls.isEmpty { draw(urls, x: margin + 14, y: cursor, width: width, font: .monospacedSystemFont(ofSize: 8, weight: .regular), color: muted); cursor -= height(urls, width: width, font: .monospacedSystemFont(ofSize: 8, weight: .regular)) + 4 }
         draw(recommendation, x: margin + 14, y: cursor, width: width, font: .systemFont(ofSize: 9.5, weight: .medium), color: ink); y -= boxHeight + 9
+    }
+    private func backlinkDetails() -> String {
+        let detail = report.backlinkProfileDetail
+        let domains = detail.topReferringDomains.prefix(50).map { "• \($0.domain) — Rank \($0.rank), \($0.backlinks) backlinks, spam \($0.spamScore)" }
+        let sources = Dictionary(grouping: detail.topBacklinkSources, by: \.donorType).keys.sorted().flatMap { type in
+            ["\(type.capitalized):"] + Dictionary(grouping: detail.topBacklinkSources, by: \.donorType)[type, default: []].prefix(50).map { "• \($0.sourceDomain) [\($0.anchorType)] — PR \($0.pageRank), \($0.sourceURL)" }
+        }
+        let distribution = detail.domainRankDistribution.map { "\($0.type): \($0.count)" }.joined(separator: ", ")
+        return "Rank distribution: \(distribution)\nTop referring domains:\n\(domains.joined(separator: "\n"))\nTop backlink sources by category:\n\(sources.joined(separator: "\n"))"
+    }
+    private func technicalDetails() -> String {
+        let issues = report.technicalIssuesDetail.issues.map { issue in
+            "• \(issue.priority) · \(issue.name): \(issue.count) URL (\(String(format: "%.1f", issue.percentage))%), page types: \(issue.pageTypesAffected.joined(separator: ", "))\n  \(issue.examples.prefix(10).joined(separator: "\n  "))"
+        }
+        let findings = report.technicalIssuesDetail.auditFindings.map { "• \($0.severity) · \($0.title): \($0.detail)\n  \($0.examples.prefix(10).joined(separator: "\n  "))" }
+        return (issues + findings).isEmpty ? "No structured technical issues available." : (issues + findings).joined(separator: "\n")
+    }
+    private func gscDetails() -> String {
+        let errors = report.searchConsoleErrorsDetail.errors.map { error in
+            let examples = error.exampleDetails.prefix(30).map { "  \($0.url) · HTTP \($0.httpStatus.map(String.init) ?? "—") · \($0.indexability) · \($0.pageType)" }.joined(separator: "\n")
+            return "• \(error.type): \(error.count)\n\(examples)"
+        }
+        return errors.isEmpty ? "No structured Search Console errors available." : errors.joined(separator: "\n")
     }
     private func paragraph(_ text: String, font: NSFont = .systemFont(ofSize: 10.5), color: NSColor, spacing: CGFloat = 7) {
         var wrapped = lines(text, width: page.width - margin * 2, font: font)

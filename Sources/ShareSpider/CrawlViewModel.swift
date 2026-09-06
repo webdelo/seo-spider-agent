@@ -33,6 +33,8 @@ final class CrawlViewModel: ObservableObject {
     @Published private(set) var issueSelection: Issue?
     @Published private(set) var auditReport: AuditReport?
     @Published private(set) var auditRunning = false
+    @Published private(set) var aiAuditRunning = false
+    @Published private(set) var aiAuditReport: AIAuditReport?
     @Published private(set) var pageSpeedResults: [PageSpeedResult] = []
     @Published private(set) var pageSpeedRunning = false
     @Published private(set) var visualAuditResults: [VisualAuditResult] = []
@@ -233,8 +235,8 @@ final class CrawlViewModel: ObservableObject {
     func resetAuditAndCrawl() {
         stop()
         resetCrawlResults()
-        auditReport = nil; pageSpeedResults = []; visualAuditResults = []
-        approvedVisualIssueIDs = []; auditRunning = false; pageSpeedRunning = false
+        auditReport = nil; aiAuditReport = nil; pageSpeedResults = []; visualAuditResults = []
+        approvedVisualIssueIDs = []; auditRunning = false; aiAuditRunning = false; pageSpeedRunning = false
         visualAuditRunning = false; visualAuditProgress = nil; visualAuditor = nil
         state = .idle; startedAt = nil; queued = 0
     }
@@ -354,6 +356,7 @@ final class CrawlViewModel: ObservableObject {
         recordIndexByURL.removeAll(keepingCapacity: false)
         inlinkCounts.removeAll(keepingCapacity: false)
         records = []; issues = []; overview = []; cachedErrors = 0
+        aiAuditReport = nil; aiAuditRunning = false
         backlinkReport = nil; backlinkProgress = 0; backlinkTotal = 0; backlinkMessage = ""
         backlinkSourceDetails = []; backlinkHistory = []; referringDomainDetails = []
         overviewSelectionName = nil; overviewSelectionIDs = []; issueSelection = nil
@@ -629,6 +632,22 @@ final class CrawlViewModel: ObservableObject {
             }, updatedAt: Date()))
             await MainActor.run { self.auditReport = report; self.auditRunning = false }
         }
+    }
+    func runAIAudit() {
+        guard !aiAuditRunning, !records.isEmpty else { return }
+        aiAuditRunning = true
+        let startURL = startText
+        let data = AIAuditCollector.collect(records: records, auditReport: auditReport, backlinkReport: backlinkReport, startURL: startURL)
+        Task { [weak self] in
+            let report = await AIAuditAnalyzer.analyze(data: data, startURL: startURL)
+            guard !Task.isCancelled else { return }
+            self?.aiAuditReport = report
+            self?.aiAuditRunning = false
+        }
+    }
+    func exportAIAuditPDF() {
+        guard let report = aiAuditReport else { return }
+        _ = AIAuditPDFReport.export(report: report, startURL: startText)
     }
     func exportTechnicalTasks(severity: TechnicalTaskPDFReport.Severity) {
         guard !records.isEmpty else { return }

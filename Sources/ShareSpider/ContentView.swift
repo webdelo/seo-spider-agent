@@ -56,9 +56,13 @@ private enum URLListTransfer {
     }
 
     @MainActor
-    static func export(name: String, header: [String], rows: [[String]]) {
+    static func export(name: String, header: [String], rows: [[String]], site: String? = nil) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = name
+        let report = name
+            .replacingOccurrences(of: "SEOSpiderAgent-", with: "")
+            .replacingOccurrences(of: ".csv", with: "", options: [.caseInsensitive])
+        let inferredSite = site ?? rows.first?.first ?? ""
+        panel.nameFieldStringValue = ReportFileNaming.csvFileName(report: report, site: inferredSite)
         panel.canCreateDirectories = true
         panel.directoryURL = ReportFileNaming.downloadsDirectory
         guard panel.runModal() == .OK, let destination = panel.url else { return }
@@ -637,12 +641,12 @@ struct AffectedURLsView: View {
                 BacklinkDrilldownList(model: model, kind: kind)
             } else if !model.overviewSelectionImageItems.isEmpty {
                 Text("\(model.overviewSelectionImageItems.count) image URL\(model.overviewSelectionImageItems.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
-                AffectedImageList(items: model.overviewSelectionImageItems, exportName: "SEOSpiderAgent-\(metric.replacingOccurrences(of: "/", with: "-"))-images.csv")
+                AffectedImageList(items: model.overviewSelectionImageItems, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-Images", site: model.startText)
             } else if !model.overviewSelectionExternalURLs.isEmpty {
                 Text("\(model.overviewSelectionExternalURLs.count) URL\(model.overviewSelectionExternalURLs.count == 1 ? "" : "s") reported by Google Search Console")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                GSCReportedURLList(urls: model.overviewSelectionExternalURLs, crawled: model.records, exportName: "SEOSpiderAgent-\(metric.replacingOccurrences(of: "/", with: "-"))-GSC-URLs.csv")
+                GSCReportedURLList(urls: model.overviewSelectionExternalURLs, crawled: model.records, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-GSC-URLs", site: model.startText)
             } else {
                 Text("\(records.count) URL\(records.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
                 if records.isEmpty && metric.hasPrefix("GSC") {
@@ -652,7 +656,7 @@ struct AffectedURLsView: View {
                         description: Text("Google supplied the category total but did not provide individual URLs in this report. The existing crawl data is not replaced.")
                     )
                 } else {
-                    AffectedCrawlRecordList(records: records, exportName: "SEOSpiderAgent-\(metric.replacingOccurrences(of: "/", with: "-"))-URLs.csv")
+                    AffectedCrawlRecordList(records: records, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-URLs", site: model.startText)
                     Button("Open filtered table in URLs") { showURLs() }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
@@ -666,6 +670,7 @@ struct AffectedURLsView: View {
 private struct AffectedImageList: View {
     let items: [OverviewImageItem]
     let exportName: String
+    let site: String
     @State private var selection = Set<String>()
 
     private var selected: [OverviewImageItem] { items.filter { selection.contains($0.id) } }
@@ -679,7 +684,7 @@ private struct AffectedImageList: View {
                 Button("Select all") { selection = Set(items.map(\.id)) }.disabled(items.isEmpty)
                 Button("Copy selected") { URLListTransfer.copy(selected.map(\.imageURL)) }.disabled(selected.isEmpty)
                 Button("Copy all") { URLListTransfer.copy(items.map(\.imageURL)) }.disabled(items.isEmpty)
-                Button("Export all") { URLListTransfer.export(name: exportName, header: ["Image URL", "Found on pages"], rows: exportRows) }.disabled(items.isEmpty)
+                Button("Export all") { URLListTransfer.export(name: exportName, header: ["Image URL", "Found on pages"], rows: exportRows, site: site) }.disabled(items.isEmpty)
                 Spacer()
                 Text("\(selected.count) selected").font(.caption).foregroundStyle(.secondary)
             }
@@ -714,6 +719,7 @@ private struct AffectedImageList: View {
 private struct AffectedCrawlRecordList: View {
     let records: [CrawlRecord]
     let exportName: String
+    let site: String
     @State private var selection = Set<CrawlRecord.ID>()
 
     private var selectedRecords: [CrawlRecord] { records.filter { selection.contains($0.id) } }
@@ -727,7 +733,7 @@ private struct AffectedCrawlRecordList: View {
                 Button("Select all") { selection = Set(records.map(\.id)) }.disabled(records.isEmpty)
                 Button("Copy selected") { URLListTransfer.copy(selectedRecords.map { $0.url.absoluteString }) }.disabled(selectedRecords.isEmpty)
                 Button("Copy all") { URLListTransfer.copy(records.map { $0.url.absoluteString }) }.disabled(records.isEmpty)
-                Button("Export all") { URLListTransfer.export(name: exportName, header: ["URL", "Status", "Title", "Page type"], rows: exportRows) }.disabled(records.isEmpty)
+                Button("Export all") { URLListTransfer.export(name: exportName, header: ["URL", "Status", "Title", "Page type"], rows: exportRows, site: site) }.disabled(records.isEmpty)
                 Spacer()
                 Text("\(selectedRecords.count) selected").font(.caption).foregroundStyle(.secondary)
             }
@@ -837,7 +843,7 @@ struct IssueURLsView: View {
                 Button { model.clearIssueSelection() } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain)
             }
             if !issue.externalURLs.isEmpty {
-                GSCReportedURLList(urls: issue.externalURLs, crawled: model.records, exportName: "SEOSpiderAgent-\(issue.name.replacingOccurrences(of: "/", with: "-"))-GSC-URLs.csv")
+                GSCReportedURLList(urls: issue.externalURLs, crawled: model.records, exportName: "\(issue.name.replacingOccurrences(of: "/", with: "-"))-GSC-URLs", site: model.startText)
             } else if issue.reportedCount != nil {
                 ContentUnavailableView(
                     "Google reported \(issue.count) URL\(issue.count == 1 ? "" : "s"), without an address list",
@@ -862,6 +868,7 @@ struct GSCReportedURLList: View {
     let urls: [String]
     let crawled: [CrawlRecord]
     let exportName: String
+    let site: String
     @State private var selection = Set<String>()
     private func record(_ value: String) -> CrawlRecord? { crawled.first { $0.url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == value.trimmingCharacters(in: CharacterSet(charactersIn: "/")) } }
     private var selectedURLs: [String] { urls.filter { selection.contains($0) } }
@@ -878,7 +885,8 @@ struct GSCReportedURLList: View {
                         rows: urls.map { value in
                             let current = record(value)
                             return [value, current?.statusText ?? "Not found in current crawl", current?.title ?? "", current?.displayPageType ?? ""]
-                        }
+                        },
+                        site: site
                     )
                 }.disabled(urls.isEmpty)
                 Spacer()

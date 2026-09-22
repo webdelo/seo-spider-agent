@@ -80,11 +80,14 @@ async function waitForFirstVisible(locator, timeout = 8_000) {
 // Chrome builds throw "ErrorCaptureStackTrace" on those calls, which aborts
 // the whole export. Plain locator iteration is slower but robust.
 async function openTopLinkingSites(page) {
+  // On some current GSC layouts the deep report is already open after
+  // navigation. Do not require a “More” button in that case.
+  if (await topLinkingSitesTable(page)) return true;
   // GSC renders its visible action as "MORE" followed by a chevron icon, so
   // its accessible text is often "MORE\\n", rather than exactly "More".
   // Match the label as a word/line item while keeping the card-heading check
   // below to distinguish donor domains from the other three More controls.
-  const more = /(?:^|\s)(?:more|more sample links|больше|ещ[её]|показать больше)(?:\s|$)/i;
+  const more = /(?:^|\s)(?:more|view all|see all|more sample links|больше|ещ[её]|показать больше|mehr|alle anzeigen)(?:\s|$)/i;
   const heading = /top linking sites|ссылающ(?:иеся|ихся) сайт|домены,? ссылающиеся/i;
   // The GSC shell paints first; its report cards arrive several seconds later.
   // Poll instead of treating a still-loading report as a missing action.
@@ -137,6 +140,24 @@ async function openTopLinkingSites(page) {
     await page.waitForTimeout(750);
   }
   return 'not-found';
+}
+
+async function openLinksReport(page, target) {
+  const parsed = new URL(target);
+  const urlPrefix = `${parsed.protocol}//${parsed.host}/`;
+  // A site can be verified either as a URL-prefix property or as a domain
+  // property. Try both common property identifiers before declaring that GSC
+  // has no report table; this fixes links sync for domain-property accounts.
+  const candidates = [urlPrefix, `sc-domain:${parsed.hostname.replace(/^www\./i, '')}`];
+  for (const resource of candidates) {
+    await page.goto(`https://search.google.com/search-console/links?resource_id=${encodeURIComponent(resource)}`, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(5_000);
+    const text = await page.locator('body').innerText().catch(() => '');
+    if (/oops[,!]?\s*you (?:don't|do not) have access to this property|нет доступа к этому ресурсу|нет доступа к этому объекту/i.test(text)) {
+      throw new Error('Google Search Console access denied for this property.');
+    }
+    if (await topLinkingSitesTable(page) || /top linking sites|ссылающ|домены/i.test(text)) return;
+  }
 }
 
 // Attach a page snapshot to a status entry so that when an export step fails
@@ -266,11 +287,10 @@ try {
   // Closing/redirecting that shared tab was the source of intermittent
   // "Target page, context or browser has been closed" failures.
   page = await context.newPage();
-  const resource = encodeURIComponent(target);
-  // domcontentloaded can fire before the GSC app paints. Give the report a
-  // generous settle window; the interaction checks below handle the rest.
-  await page.goto(`https://search.google.com/search-console/links?resource_id=${resource}`, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await page.waitForTimeout(6_000);
+  // domcontentloaded can fire before the GSC app paints. The helper tries URL
+  // prefix and domain-property forms, then the interaction checks below wait
+  // for the report card itself.
+  await openLinksReport(page, target);
 
   const pageText = await page.locator('body').innerText().catch(() => '');
   if (/sign in|войти|choose an account|выберите аккаунт/i.test(pageText)) {

@@ -619,6 +619,10 @@ final class CrawlViewModel: ObservableObject {
     func clearIssueSelection() { issueSelection = nil }
     func refreshBacklinkData(force: Bool = true) {
         guard !records.isEmpty, !backlinkRunning else { return }
+        guard DataForSEOCredentials.isConfigured else {
+            backlinkMessage = "DataForSEO is not configured. Add the API login and password in Settings → Integrations."
+            return
+        }
         let canonicalPages = records.filter { $0.isGSCEligible }.map { $0.url.absoluteString }
         guard !canonicalPages.isEmpty else { backlinkMessage = "No canonical HTML pages are available for backlink enrichment."; return }
         let startURL = startText
@@ -669,9 +673,12 @@ final class CrawlViewModel: ObservableObject {
     func runBacklinkProfileAnalysis() {
         guard state != .crawling, state != .paused,
               !startText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        loadBacklinkSourceAnalysis()
+        if DataForSEOCredentials.isConfigured { loadBacklinkSourceAnalysis() }
+        else { dataForSEOProfileMessage = "DataForSEO is not configured — add API login and password in Settings." }
         if AhrefsKeychain.isConfigured { loadAhrefsReferringDomains() }
+        else { ahrefsComparisonMessage = "Ahrefs is not configured — add an API key in Settings." }
         if UbersuggestMCPAuth.shared.isConnected { loadUbersuggestReferringDomains() }
+        else { ubersuggestComparisonMessage = "Ubersuggest is not connected — connect it in Settings." }
         syncGSCBacklinksThroughChrome()
     }
 
@@ -829,6 +836,11 @@ final class CrawlViewModel: ObservableObject {
     func loadAhrefsReferringDomains() {
         guard state != .crawling, state != .paused,
               !ahrefsComparisonRunning, !startText.isEmpty else { return }
+        guard AhrefsKeychain.isConfigured else {
+            ahrefsComparisonMessage = "Ahrefs is not configured — add an API key in Settings."
+            backlinkMessage = ahrefsComparisonMessage
+            return
+        }
         ahrefsComparisonRunning = true
         ahrefsComparisonProgress = 0; ahrefsComparisonTotal = 1
         ahrefsComparisonMessage = "Requesting referring domains…"
@@ -865,6 +877,11 @@ final class CrawlViewModel: ObservableObject {
     func loadUbersuggestReferringDomains() {
         guard state != .crawling, state != .paused,
               !ubersuggestComparisonRunning, !startText.isEmpty else { return }
+        guard UbersuggestMCPAuth.shared.isConnected else {
+            ubersuggestComparisonMessage = "Ubersuggest is not connected — connect it in Settings."
+            backlinkMessage = ubersuggestComparisonMessage
+            return
+        }
         ubersuggestComparisonRunning = true
         ubersuggestComparisonProgress = 0; ubersuggestComparisonTotal = 1
         ubersuggestComparisonMessage = "Requesting referring domains…"
@@ -900,6 +917,10 @@ final class CrawlViewModel: ObservableObject {
     }
     private func loadBacklinkDrilldown(_ kind: BacklinkDrilldownKind) {
         guard !backlinkDrilldownRunning else { return }
+        guard DataForSEOCredentials.isConfigured else {
+            backlinkMessage = "DataForSEO is not configured. Add the API login and password in Settings → Integrations."
+            return
+        }
         backlinkDrilldownKind = kind; backlinkDrilldownRunning = true
         let target = startText
         backlinkDetailTask = Task { [weak self] in
@@ -926,6 +947,12 @@ final class CrawlViewModel: ObservableObject {
     func loadBacklinkSourceAnalysis() {
         guard state != .crawling, state != .paused,
               !backlinkDrilldownRunning, !startText.isEmpty else { return }
+        guard DataForSEOCredentials.isConfigured else {
+            let message = "DataForSEO is not configured. Add the API login and password in Settings → Integrations."
+            backlinkMessage = message
+            dataForSEOProfileMessage = message
+            return
+        }
         backlinkDrilldownKind = .backlinks
         backlinkDrilldownRunning = true
         backlinkSourceDetails = []; backlinkHistory = []; backlinkProgress = 0; backlinkTotal = 0
@@ -1686,7 +1713,7 @@ final class CrawlViewModel: ObservableObject {
         case .redirects: rows = CSV.urls(records.filter { $0.redirectURL != nil || ($0.statusCode ?? 0) / 100 == 3 })
         case .imagesWithoutAlt: rows = CSV.images(records)
         }
-        let panel = NSSavePanel(); panel.allowedContentTypes = [.commaSeparatedText]; panel.nameFieldStringValue = "ShareSpider-\(scope.rawValue).csv"; panel.directoryURL = ReportFileNaming.downloadsDirectory
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.commaSeparatedText]; panel.nameFieldStringValue = ReportFileNaming.csvFileName(report: scope.rawValue, site: startText); panel.directoryURL = ReportFileNaming.downloadsDirectory
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         try? rows.joined(separator: "\n").write(to: destination, atomically: true, encoding: .utf8)
     }

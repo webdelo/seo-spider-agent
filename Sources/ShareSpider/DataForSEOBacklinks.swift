@@ -170,8 +170,9 @@ enum DataForSEOBacklinks {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ServiceError.invalidResponse }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw ServiceError.invalidResponse }
-        if http.statusCode >= 300 { throw ServiceError.api(readableError(from: json, fallback: "DataForSEO HTTP \(http.statusCode)")) }
+        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        if http.statusCode >= 300 { throw ServiceError.api(readableError(from: json, fallback: httpFailure(http.statusCode))) }
+        guard !json.isEmpty else { throw ServiceError.invalidResponse }
         if let code = int(json["status_code"]), code != 20000 { throw ServiceError.api(readableError(from: json, fallback: "DataForSEO status \(code)")) }
         if let task = (json["tasks"] as? [[String: Any]])?.first, let code = int(task["status_code"]), code != 20000 { throw ServiceError.api(readableError(from: task, fallback: "DataForSEO task status \(code)")) }
         return json
@@ -179,10 +180,26 @@ enum DataForSEOBacklinks {
     private static func message(from object: [String: Any]) -> String? { (object["status_message"] as? String) ?? (object["message"] as? String) }
     private static func readableError(from object: [String: Any], fallback: String) -> String {
         let raw = message(from: object) ?? fallback
-        if raw.localizedCaseInsensitiveContains("verify your account") {
+        let normalized = raw.lowercased()
+        if normalized.contains("verify your account") {
             return "DataForSEO account verification is required. Complete it in the DataForSEO user panel, then run Refresh Backlink Data again."
         }
+        if normalized.contains("insufficient") || normalized.contains("balance") || normalized.contains("subscription") || normalized.contains("billing") {
+            return "DataForSEO access was denied because the account has no active balance or subscription. Renew the DataForSEO plan or add funds, then try again."
+        }
+        if normalized.contains("authentication") || normalized.contains("unauthorized") || normalized.contains("invalid login") {
+            return "DataForSEO rejected the API login or password. Check them in Settings → Integrations."
+        }
         return raw
+    }
+    private static func httpFailure(_ status: Int) -> String {
+        switch status {
+        case 401: return "DataForSEO rejected the API login or password (HTTP 401). Check Settings → Integrations."
+        case 402: return "DataForSEO access was denied because the account has no active balance or subscription (HTTP 402)."
+        case 403: return "DataForSEO denied access to this endpoint or plan (HTTP 403)."
+        case 429: return "DataForSEO request limit was reached (HTTP 429). Wait before trying again."
+        default: return "DataForSEO HTTP \(status)"
+        }
     }
     private static func collectItems(_ object: [String: Any]) -> [[String: Any]] {
         guard let task = (object["tasks"] as? [[String: Any]])?.first else { return [] }

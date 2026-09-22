@@ -19,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-	<string>1.5.3</string>
+	<string>1.5.4</string>
     <key>CFBundleVersion</key>
-	<string>21</string>
+	<string>22</string>
     <key>CFBundleURLTypes</key>
     <array><dict><key>CFBundleURLName</key><string>ShareSpider scan command</string><key>CFBundleURLSchemes</key><array><string>sharespider</string></array></dict></array>
     <key>LSMinimumSystemVersion</key>

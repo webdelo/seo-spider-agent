@@ -1,5 +1,26 @@
 import Foundation
 
+/// Compares web documents for SEO checks. Fragments identify a position inside
+/// a document, not a different canonical document, so they are deliberately
+/// ignored here.
+enum URLIdentity {
+    static func pageKey(_ rawValue: String) -> String {
+        guard var components = URLComponents(string: rawValue) else {
+            return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        }
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        components.fragment = nil
+        if components.path == "/" { components.path = "" }
+        else if components.path.hasSuffix("/") { components.path.removeLast() }
+        return components.string ?? rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+    }
+
+    static func isSamePage(_ lhs: String, _ rhs: String) -> Bool {
+        pageKey(lhs) == pageKey(rhs)
+    }
+}
+
 enum CrawlMode: String, CaseIterable, Identifiable { case spider = "Spider", list = "List"; var id: String { rawValue } }
 enum CrawlState: Equatable { case idle, crawling, paused, finished, stopped
     var label: String { switch self { case .idle: "Ready"; case .crawling: "Crawling"; case .paused: "Paused"; case .finished: "Complete"; case .stopped: "Stopped" } }
@@ -227,8 +248,7 @@ struct CrawlRecord: Identifiable, Hashable, Sendable {
     /// PDFs, images, error pages and alternate canonical variants are excluded.
     var isGSCEligible: Bool {
         guard isSEOPage, !isImageCandidate else { return false }
-        let declared = canonical.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return !declared.isEmpty && declared == url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return !canonical.isEmpty && URLIdentity.isSamePage(canonical, url.absoluteString)
     }
     var isImageCandidate: Bool { isImagePath || isImageResource }
     /// AI Bust is one intentional page type. Its internal category remains
@@ -253,6 +273,11 @@ struct PageResource: Hashable, Sendable {
 }
 
 struct CrawledImage: Hashable, Sendable { var url: String; var alt: String; var width: String; var height: String; var size: Int = 0 }
+struct OverviewImageItem: Identifiable, Hashable, Sendable {
+    var imageURL: String
+    var pageURLs: [URL]
+    var id: String { imageURL }
+}
 /// A link as it appeared in the source HTML. The destination record keeps these
 /// details available for developer-facing tasks: where the broken URL was found
 /// and which anchor needs to be corrected.
@@ -263,8 +288,8 @@ struct Issue: Identifiable, Hashable, Sendable { let id = UUID(); let name: Stri
     var count: Int { reportedCount ?? max(urlIDs.count, externalURLs.count) }
 }
 
-struct OverviewItem: Identifiable, Hashable, Sendable { let id = UUID(); let name: String; let urlIDs: Set<UUID>; var denominator: Int; var children: [OverviewItem] = []; var displayCount: Int? = nil
-    var count: Int { displayCount ?? urlIDs.count }
+struct OverviewItem: Identifiable, Hashable, Sendable { let id = UUID(); let name: String; let urlIDs: Set<UUID>; var denominator: Int; var children: [OverviewItem] = []; var displayCount: Int? = nil; var imageItems: [OverviewImageItem] = []
+    var count: Int { displayCount ?? (imageItems.isEmpty ? urlIDs.count : imageItems.count) }
     var outlineChildren: [OverviewItem]? { children.isEmpty ? nil : children }
 }
 
@@ -400,4 +425,8 @@ struct HreflangResult: Identifiable, Sendable {
     let id = UUID(); var source: URL; var code: String; var target: URL; var status: Int?; var finalURL: URL?
     var reciprocal = false; var validCode = true; var selfReference = false; var targetCanonical = ""; var targetNoindex = false
     var targetLanguage = ""; var languageMatches = true; var duplicateCode = false; var conflict = false; var returnLinkCheckable = false; var returnLinkTargets: Set<String> = []; var error = ""
+    var resolvesToDeclaredTarget: Bool {
+        guard let finalURL else { return false }
+        return URLIdentity.isSamePage(finalURL.absoluteString, target.absoluteString)
+    }
 }

@@ -635,6 +635,9 @@ struct AffectedURLsView: View {
             }
             if let kind = model.backlinkDrilldownKind {
                 BacklinkDrilldownList(model: model, kind: kind)
+            } else if !model.overviewSelectionImageItems.isEmpty {
+                Text("\(model.overviewSelectionImageItems.count) image URL\(model.overviewSelectionImageItems.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+                AffectedImageList(items: model.overviewSelectionImageItems, exportName: "SEOSpiderAgent-\(metric.replacingOccurrences(of: "/", with: "-"))-images.csv")
             } else if !model.overviewSelectionExternalURLs.isEmpty {
                 Text("\(model.overviewSelectionExternalURLs.count) URL\(model.overviewSelectionExternalURLs.count == 1 ? "" : "s") reported by Google Search Console")
                     .font(.caption)
@@ -655,6 +658,54 @@ struct AffectedURLsView: View {
             }
         }
         .padding(.trailing, 8)
+    }
+}
+
+/// Image diagnostics are grouped by the image address. The affected pages stay
+/// available beneath each image without making a page URL look like the issue.
+private struct AffectedImageList: View {
+    let items: [OverviewImageItem]
+    let exportName: String
+    @State private var selection = Set<String>()
+
+    private var selected: [OverviewImageItem] { items.filter { selection.contains($0.id) } }
+    private var exportRows: [[String]] {
+        items.map { [$0.imageURL, $0.pageURLs.map(\.absoluteString).joined(separator: " | ")] }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Button("Select all") { selection = Set(items.map(\.id)) }.disabled(items.isEmpty)
+                Button("Copy selected") { URLListTransfer.copy(selected.map(\.imageURL)) }.disabled(selected.isEmpty)
+                Button("Copy all") { URLListTransfer.copy(items.map(\.imageURL)) }.disabled(items.isEmpty)
+                Button("Export all") { URLListTransfer.export(name: exportName, header: ["Image URL", "Found on pages"], rows: exportRows) }.disabled(items.isEmpty)
+                Spacer()
+                Text("\(selected.count) selected").font(.caption).foregroundStyle(.secondary)
+            }
+            List(items, selection: $selection) { item in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text(item.imageURL).textSelection(.enabled).lineLimit(1)
+                        Spacer()
+                        if let url = URL(string: item.imageURL) { URLActions(url: url) }
+                    }
+                    DisclosureGroup("Found on \(item.pageURLs.count) page\(item.pageURLs.count == 1 ? "" : "s")") {
+                        ForEach(item.pageURLs, id: \.self) { pageURL in
+                            HStack {
+                                Text(pageURL.absoluteString).font(.caption).textSelection(.enabled).lineLimit(1)
+                                Spacer()
+                                URLActions(url: pageURL)
+                            }.padding(.vertical, 2)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+            .listStyle(.inset(alternatesRowBackgrounds: true))
+        }
     }
 }
 
@@ -2080,7 +2131,6 @@ private struct SitemapDocumentRow: View {
 
 private struct HreflangAuditView: View {
     let results: [HreflangResult]
-    @State private var showAllChecks = false
     var body: some View {
         GroupBox("hreflang validation") {
             if results.isEmpty { Text("No hreflang alternate links were found on crawled HTML pages.").foregroundStyle(.secondary) }
@@ -2090,7 +2140,7 @@ private struct HreflangAuditView: View {
                     HStack(spacing: 14) {
                         Text("Checked: \(results.count)")
                         Text("Problems: \(problems.count)").foregroundStyle(problems.isEmpty ? .green : .orange)
-                        Text("Final 200: \(results.count - results.filter { ($0.status ?? 0) / 100 != 2 || $0.finalURL != $0.target }.count)").foregroundStyle(.secondary)
+                        Text("Final 200: \(results.count - results.filter { ($0.status ?? 0) / 100 != 2 || !$0.resolvesToDeclaredTarget }.count)").foregroundStyle(.secondary)
                         Text("Missing return links: \(results.filter { $0.returnLinkCheckable && !$0.reciprocal }.count)").foregroundStyle(.secondary)
                     }.font(.caption)
                     if problems.isEmpty { Text("All checked hreflang targets are final 200 URLs and have valid return links.").foregroundStyle(.green) }
@@ -2099,23 +2149,22 @@ private struct HreflangAuditView: View {
                         ForEach(problems.prefix(10)) { result in HreflangResultRow(result: result) }
                         if problems.count > 10 { Text("and \(problems.count - 10) more problem(s)").font(.caption).foregroundStyle(.secondary) }
                     }
-                    DisclosureGroup("Show all \(results.count) checked hreflang links", isExpanded: $showAllChecks) {
-                        LazyVStack(alignment: .leading, spacing: 6) { ForEach(results) { HreflangResultRow(result: $0) } }
-                    }.font(.caption)
+                    Text("Correct hreflang links are verified but not listed here, so the audit remains focused on items that need attention.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
     }
-    private func isProblem(_ result: HreflangResult) -> Bool { (result.status ?? 0) / 100 != 2 || result.finalURL != result.target || (result.returnLinkCheckable && !result.reciprocal) || !result.validCode || !result.selfReference || result.targetNoindex || result.duplicateCode || result.conflict || !result.languageMatches }
+    private func isProblem(_ result: HreflangResult) -> Bool { (result.status ?? 0) / 100 != 2 || !result.resolvesToDeclaredTarget || (result.returnLinkCheckable && !result.reciprocal) || !result.validCode || !result.selfReference || result.targetNoindex || result.duplicateCode || result.conflict || !result.languageMatches }
 }
 
 private struct HreflangResultRow: View {
     let result: HreflangResult
-    private var problem: Bool { (result.status ?? 0) / 100 != 2 || result.finalURL != result.target || (result.returnLinkCheckable && !result.reciprocal) || !result.validCode || !result.selfReference || result.targetNoindex || result.duplicateCode || result.conflict || !result.languageMatches }
+    private var problem: Bool { (result.status ?? 0) / 100 != 2 || !result.resolvesToDeclaredTarget || (result.returnLinkCheckable && !result.reciprocal) || !result.validCode || !result.selfReference || result.targetNoindex || result.duplicateCode || result.conflict || !result.languageMatches }
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack { Text(result.code).font(.caption.weight(.bold)).padding(.horizontal, 6).padding(.vertical, 3).background(.quaternary).clipShape(Capsule()); Text(result.target.absoluteString).lineLimit(1); URLActions(url: result.target); Spacer(); Text(result.status.map(String.init) ?? "Error").foregroundStyle(problem ? .red : .green) }
-            Text("Source: \(result.source.absoluteString) · \(result.returnLinkCheckable ? (result.reciprocal ? "return link found" : "return link missing") : "return link not verified")\(result.selfReference ? " · self-reference found" : " · self-reference missing")\(!result.validCode ? " · invalid language/region code" : "")\(result.duplicateCode ? " · duplicate code" : "")\(result.conflict ? " · conflicting target" : "")\(result.targetNoindex ? " · target noindex" : "")\(!result.languageMatches ? " · html lang \(result.targetLanguage) differs from hreflang" : "")\(result.finalURL != result.target ? " · redirects to \(result.finalURL?.absoluteString ?? result.error)" : "")").font(.caption).foregroundStyle(problem ? .orange : .secondary).lineLimit(2)
+            Text("Source: \(result.source.absoluteString) · \(result.returnLinkCheckable ? (result.reciprocal ? "return link found" : "return link missing") : "return link not verified")\(result.selfReference ? " · self-reference found" : " · self-reference missing")\(!result.validCode ? " · invalid language/region code" : "")\(result.duplicateCode ? " · duplicate code" : "")\(result.conflict ? " · conflicting target" : "")\(result.targetNoindex ? " · target noindex" : "")\(!result.languageMatches ? " · html lang \(result.targetLanguage) differs from hreflang" : "")\(!result.resolvesToDeclaredTarget ? " · redirects to \(result.finalURL?.absoluteString ?? result.error)" : "")").font(.caption).foregroundStyle(problem ? .orange : .secondary).lineLimit(2)
         }
     }
 }
@@ -2626,7 +2675,7 @@ struct SettingsView: View {
                 if aiProviderSettings.agent == .hermes {
                     GroupBox("Hermes") {
                         TextField("Hermes Endpoint", text: $hermesSettings.endpoint)
-                        SecureField("Hermes API key", text: $hermesSettings.apiKey)
+                        PremiumCredentialField("Hermes API key", text: $hermesSettings.apiKey)
                         HStack {
                             Text("Status: \(hermesStatus.message)")
                                 .foregroundStyle(hermesStatus.connected ? .green : .secondary)
@@ -2642,7 +2691,7 @@ struct SettingsView: View {
                     }
                 }
                 GroupBox("OpenRouter") {
-                    SecureField("OpenRouter API key", text: $openRouterKey)
+                    PremiumCredentialField("OpenRouter API key", text: $openRouterKey)
                     if openRouterKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("API key is not configured.").font(.caption).foregroundStyle(.secondary)
                     } else {
@@ -2653,11 +2702,11 @@ struct SettingsView: View {
                     Link("Open OpenRouter keys", destination: URL(string: "https://openrouter.ai/keys")!)
                 }
                 GroupBox("Integrations · DataForSEO Backlinks") {
-                    TextField("API login", text: $dataForSEOLogin)
-                    SecureField("API password", text: $dataForSEOPassword)
+                    PremiumCredentialField("API login", text: $dataForSEOLogin, secure: false)
+                    PremiumCredentialField("API password", text: $dataForSEOPassword)
                 }
                 GroupBox("Integrations · Ahrefs") {
-                    SecureField("Ahrefs API key", text: $ahrefsKey)
+                    PremiumCredentialField("Ahrefs API key", text: $ahrefsKey)
                     if ahrefsKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("Optional. Configure a key to add Ahrefs Domain Rating to each audit.")
                             .font(.caption).foregroundStyle(.secondary)
@@ -2686,13 +2735,13 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 GroupBox("Integrations · PageSpeed Insights") {
-                    SecureField("Optional Google API Key", text: $pageSpeedKey)
+                    PremiumCredentialField("Optional Google API Key", text: $pageSpeedKey)
                     Text("Stored locally in ShareSpider's Application Support folder. Leave blank to use the unauthenticated API quota.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 GroupBox("Integrations · Google Search Console") {
-                    TextField("OAuth desktop client ID", text: $searchConsoleClientID)
-                    SecureField("OAuth client secret (optional)", text: $searchConsoleClientSecret)
+                    PremiumCredentialField("OAuth desktop client ID", text: $searchConsoleClientID, secure: false)
+                    PremiumCredentialField("OAuth client secret (optional)", text: $searchConsoleClientSecret)
                     Text(searchConsole.status).font(.caption).foregroundStyle(searchConsole.isConnected ? .green : .secondary)
                     HStack {
                         Button(searchConsole.isAuthorizing ? "Waiting for Google…" : (searchConsole.isConnected ? "Reconnect" : "Connect Google Search Console")) {
@@ -2733,7 +2782,43 @@ struct SettingsView: View {
                 .keyboardShortcut(.defaultAction)
             }
         }
-        .padding()
+        .padding(20)
+        .background(LinearGradient(colors: [.white, Color(nsColor: .windowBackgroundColor)], startPoint: .top, endPoint: .bottom))
         .frame(width: 680, height: 680)
+    }
+}
+
+/// Deliberately card-like credential inputs make the places that require a
+/// key or password obvious without changing how credentials are stored.
+private struct PremiumCredentialField: View {
+    let title: String
+    @Binding var text: String
+    var secure = true
+
+    init(_ title: String, text: Binding<String>, secure: Bool = true) {
+        self.title = title
+        _text = text
+        self.secure = secure
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Group {
+                if secure { SecureField("Enter \(title.lowercased())", text: $text) }
+                else { TextField("Enter \(title.lowercased())", text: $text) }
+            }
+            .textFieldStyle(.plain)
+            .multilineTextAlignment(.leading)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.white)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor.opacity(0.32), lineWidth: 1))
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.72))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }

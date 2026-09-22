@@ -32,6 +32,7 @@ final class CrawlViewModel: ObservableObject {
     /// URLs supplied by a property-wide GSC report.  They can be absent from
     /// the crawl, so keep them separately from local record identifiers.
     @Published private(set) var overviewSelectionExternalURLs: [String] = []
+    @Published private(set) var overviewSelectionImageItems: [OverviewImageItem] = []
     @Published private(set) var issueSelection: Issue?
     @Published private(set) var auditReport: AuditReport?
     @Published private(set) var auditRunning = false
@@ -398,7 +399,7 @@ final class CrawlViewModel: ObservableObject {
         state = .idle; startedAt = nil; queued = 0
     }
     func selectOverview(_ item: OverviewItem) {
-        overviewSelectionName = item.name; overviewSelectionIDs = item.urlIDs
+        overviewSelectionName = item.name; overviewSelectionIDs = item.urlIDs; overviewSelectionImageItems = item.imageItems
         overviewSelectionExternalURLs = gscSiteReport?.metrics.first(where: { $0.label == item.name })?.examples
             ?? gscCoreWebVitalsReport?.metrics.first(where: { $0.label == item.name })?.examples ?? []
         switch item.name {
@@ -407,7 +408,7 @@ final class CrawlViewModel: ObservableObject {
         default: backlinkDrilldownKind = nil
         }
     }
-    func clearOverviewSelection() { overviewSelectionName = nil; overviewSelectionIDs = []; overviewSelectionExternalURLs = []; backlinkDrilldownKind = nil }
+    func clearOverviewSelection() { overviewSelectionName = nil; overviewSelectionIDs = []; overviewSelectionExternalURLs = []; overviewSelectionImageItems = []; backlinkDrilldownKind = nil }
     /// Network workers deliver records independently. Publishing each one forces
     /// SwiftUI to redraw large tables hundreds of times per second, so records are
     /// committed in short batches while preserving their crawl order.
@@ -612,7 +613,7 @@ final class CrawlViewModel: ObservableObject {
         aiAuditReport = nil; customAnalyses = []; aiAuditRunning = false; aiAuditStage = .notStarted
         backlinkReport = nil; backlinkProgress = 0; backlinkTotal = 0; backlinkMessage = ""
         backlinkSourceDetails = []; backlinkHistory = []; referringDomainDetails = []
-        overviewSelectionName = nil; overviewSelectionIDs = []; issueSelection = nil
+        overviewSelectionName = nil; overviewSelectionIDs = []; overviewSelectionExternalURLs = []; overviewSelectionImageItems = []; issueSelection = nil
     }
     func selectIssue(_ issue: Issue) { issueSelection = issue }
     func clearIssueSelection() { issueSelection = nil }
@@ -1732,7 +1733,7 @@ enum IssueBuilder {
             issue("Missing canonical", "Issue", "High") { indexable($0) && $0.isCanonicalEligible && $0.canonical.isEmpty },
             issue("Multiple canonical tags", "Issue", "High") { indexable($0) && $0.isCanonicalEligible && $0.canonicalCount > 1 },
             issue("Relative canonical URL", "Warning", "Medium") { indexable($0) && $0.isCanonicalEligible && !$0.canonicalRaw.isEmpty && !$0.canonicalRaw.contains("://") },
-            issue("Canonical points to another URL", "Warning", "Medium") { indexable($0) && $0.isCanonicalEligible && !$0.canonical.isEmpty && $0.canonical.trimmingCharacters(in: CharacterSet(charactersIn: "/")) != $0.url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) },
+            issue("Canonical points to another URL", "Warning", "Medium") { indexable($0) && $0.isCanonicalEligible && !$0.canonical.isEmpty && !URLIdentity.isSamePage($0.canonical, $0.url.absoluteString) },
             issue("Title too long", "Warning", "Medium") { indexable($0) && $0.title.count > 60 },
             issue("Title too short", "Warning", "Medium") { indexable($0) && !$0.title.isEmpty && $0.title.count < 20 },
             issue("Low content", "Opportunity", "Medium") { indexable($0) && $0.isSEOPage && $0.wordCount > 0 && $0.wordCount < 200 },
@@ -1830,6 +1831,14 @@ enum OverviewBuilder {
         let externalURLs = records.filter { $0.kind == .external }
         func ids(_ source: [CrawlRecord], _ test: (CrawlRecord) -> Bool = { _ in true }) -> Set<UUID> { Set(source.filter(test).map(\.id)) }
         func row(_ name: String, _ source: [CrawlRecord], _ test: @escaping (CrawlRecord) -> Bool = { _ in true }) -> OverviewItem { OverviewItem(name: name, urlIDs: ids(source, test), denominator: source.count) }
+        func imageRow(_ name: String, _ test: @escaping (CrawledImage) -> Bool) -> OverviewItem {
+            let matches = html.flatMap { page in page.images.filter(test).map { ($0, page.url, page.id) } }
+            let grouped = Dictionary(grouping: matches, by: { $0.0.url })
+            let imageItems = grouped.map { imageURL, values in
+                OverviewImageItem(imageURL: imageURL, pageURLs: Array(Set(values.map(\.1))).sorted { $0.absoluteString < $1.absoluteString })
+            }.sorted { $0.imageURL < $1.imageURL }
+            return OverviewItem(name: name, urlIDs: Set(matches.map(\.2)), denominator: html.count, imageItems: imageItems)
+        }
         func section(_ name: String, _ source: [CrawlRecord], _ children: [OverviewItem]) -> OverviewItem { OverviewItem(name: name, urlIDs: ids(source), denominator: source.count, children: children) }
         func duplicates(_ key: (CrawlRecord) -> String) -> Set<UUID> {
             let groups = Dictionary(grouping: indexableHTML.filter { !key($0).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }, by: key)
@@ -1854,8 +1863,8 @@ enum OverviewBuilder {
             section("H1", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.h1Count == 0 }), duplicateRow("Duplicate", { $0.h1 }), row("Over 70 Characters", indexableHTML, { $0.h1.count > 70 }), row("Multiple", indexableHTML, { $0.h1Count > 1 }), row("Alt Text in H1", indexableHTML, { _ in false }), row("Non-Sequential", indexableHTML, { _ in false })]),
             section("H2", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.h2.isEmpty }), duplicateRow("Duplicate", { $0.h2 }), row("Over 70 Characters", indexableHTML, { $0.h2.count > 70 }), row("Multiple", indexableHTML, { $0.h2Count > 1 }), row("Non-Sequential", indexableHTML, { _ in false })]),
             section("Content", indexableHTML, [row("All", indexableHTML), row("Exact Duplicates", indexableHTML, { _ in false }), row("Near Duplicates", indexableHTML, { _ in false }), row("Low Content Pages", indexableHTML, { $0.wordCount > 0 && $0.wordCount < 200 }), row("Soft 404 Pages", indexableHTML, { _ in false }), row("Spelling Errors", indexableHTML, { _ in false }), row("Grammar Errors", indexableHTML, { _ in false }), row("Readability Difficult", indexableHTML, { _ in false }), row("Readability Very Difficult", indexableHTML, { _ in false }), row("Lorem Ipsum Placeholder", indexableHTML, { _ in false })]),
-            section("Images", records, [row("Images on HTML Pages", html, { !$0.images.isEmpty }), row("Image Resources Crawled", records, { $0.isImageResource }), row("Broken Image Resources", records, { $0.isImageCandidate && (!$0.error.isEmpty || ($0.statusCode ?? 0) >= 400) }), row("Heavy Image Resources", records, { $0.isImageResource && ($0.statusCode ?? 0) / 100 == 2 && $0.size > 100_000 }), row("Over 100 KB", html, { $0.images.contains { $0.size > 100_000 } }), row("Missing Alt Text", html, { $0.images.contains { $0.alt.trimmingCharacters(in: .whitespaces).isEmpty } }), row("Missing Alt Attribute", html, { _ in false }), row("Alt Text Over 100 Characters", html, { $0.images.contains { $0.alt.count > 100 } }), row("Background Images", html, { _ in false }), row("Incorrectly Sized Images", html, { _ in false }), row("Missing Size Attributes", html, { $0.images.contains { $0.width.isEmpty || $0.height.isEmpty } })]),
-            section("Canonicals", canonicalPages, [row("All", canonicalPages), row("Contains Canonical", canonicalPages, { !$0.canonical.isEmpty }), row("Self Referencing", canonicalPages, { !$0.canonical.isEmpty && $0.canonical.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == $0.url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) }), row("Canonicalised", canonicalPages, { !$0.canonical.isEmpty && $0.canonical.trimmingCharacters(in: CharacterSet(charactersIn: "/")) != $0.url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) }), row("Missing", canonicalPages, { $0.canonical.isEmpty }), row("Multiple", canonicalPages, { $0.canonicalCount > 1 }), row("Multiple Conflicting", canonicalPages, { $0.canonicalCount > 1 }), row("Non-Indexable Canonical", canonicalPages, { _ in false }), row("Canonical Is Relative", canonicalPages, { !$0.canonicalRaw.isEmpty && !$0.canonicalRaw.contains("://") })]),
+            section("Images", records, [row("Images on HTML Pages", html, { !$0.images.isEmpty }), row("Image Resources Crawled", records, { $0.isImageResource }), row("Broken Image Resources", records, { $0.isImageCandidate && (!$0.error.isEmpty || ($0.statusCode ?? 0) >= 400) }), row("Heavy Image Resources", records, { $0.isImageResource && ($0.statusCode ?? 0) / 100 == 2 && $0.size > 100_000 }), imageRow("Over 100 KB", { $0.size > 100_000 }), imageRow("Missing Alt Text", { $0.alt.trimmingCharacters(in: .whitespaces).isEmpty }), imageRow("Missing Alt Attribute", { $0.alt.trimmingCharacters(in: .whitespaces).isEmpty }), imageRow("Alt Text Over 100 Characters", { $0.alt.count > 100 }), imageRow("Background Images", { _ in false }), imageRow("Incorrectly Sized Images", { _ in false }), imageRow("Missing Size Attributes", { $0.width.isEmpty || $0.height.isEmpty })]),
+            section("Canonicals", canonicalPages, [row("All", canonicalPages), row("Contains Canonical", canonicalPages, { !$0.canonical.isEmpty }), row("Self Referencing", canonicalPages, { !$0.canonical.isEmpty && URLIdentity.isSamePage($0.canonical, $0.url.absoluteString) }), row("Canonicalised", canonicalPages, { !$0.canonical.isEmpty && !URLIdentity.isSamePage($0.canonical, $0.url.absoluteString) }), row("Missing", canonicalPages, { $0.canonical.isEmpty }), row("Multiple", canonicalPages, { $0.canonicalCount > 1 }), row("Multiple Conflicting", canonicalPages, { $0.canonicalCount > 1 }), row("Non-Indexable Canonical", canonicalPages, { _ in false }), row("Canonical Is Relative", canonicalPages, { !$0.canonicalRaw.isEmpty && !$0.canonicalRaw.contains("://") })]),
             section("Pagination", html, [row("All", html), row("Contains Pagination", html, { _ in false }), row("First Page", html, { _ in false }), row("Paginated 2+ Pages", html, { _ in false }), row("Pagination URL Not in Anchor Tag", html, { _ in false }), row("Non-200 Pagination URLs", html, { _ in false }), row("Unlinked Pagination URLs", html, { _ in false }), row("Non-Indexable", html, { _ in false }), row("Multiple Pagination URLs", html, { _ in false }), row("Pagination Loop", html, { _ in false }), row("Sequence Error", html, { _ in false })]),
             section("robots.txt", robotsBlocked, robotsRows),
             section("Google Search Console · URL inspection", gscInspected, [row("GSC · checked", gscInspected), row("GSC · unavailable / property access", gscEligible, { $0.searchConsoleIndexStatus == "Unavailable" }), row("GSC · indexed", gscInspected, { $0.searchConsoleIndexStatus == "Indexed" }), row("GSC · excluded", gscInspected, { $0.searchConsoleIndexStatus == "Not indexed" }), row("GSC · robots blocked", gscInspected, { $0.searchConsoleRobotsStatus == "Blocked" }), row("GSC · noindex", gscInspected, { $0.searchConsoleNoindexStatus.hasPrefix("noindex") }), row("GSC · mobile issues", gscInspected, { !$0.searchConsoleMobileIssues.isEmpty }), row("GSC · rich result errors", gscInspected, { !$0.searchConsoleRichResultErrors.isEmpty }), row("GSC · Top 10 URLs", gscInspected, { $0.searchConsolePerformanceChecked && $0.searchConsoleQueriesTop10 > 0 }), row("GSC · URLs with clicks", gscInspected, { $0.searchConsolePerformanceChecked && $0.searchConsoleClicks7d > 0 }), row("GSC · URLs without clicks", gscInspected, { $0.searchConsolePerformanceChecked && $0.searchConsoleClicks7d == 0 }), row("GSC · past Top 20", gscInspected, { $0.searchConsolePerformanceChecked && $0.searchConsoleQueryCount > 0 && $0.searchConsoleQueriesTop20 == 0 }), row("GSC · no queries", gscInspected, { $0.searchConsolePerformanceChecked && $0.searchConsoleQueryCount == 0 })]),

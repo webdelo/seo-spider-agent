@@ -92,7 +92,7 @@ enum AuditScanner {
         let outsideSitemap = records.filter { $0.isSEOPage && ($0.statusCode ?? 0) / 100 == 2 && !$0.inSitemap }
         if !outsideSitemap.isEmpty { report.findings.append(AuditFinding(title: "Available pages outside sitemap", severity: "Medium", detail: "\(outsideSitemap.count) successful HTML page(s) discovered by crawl are not listed in the XML sitemap.", urlIDs: Set(outsideSitemap.map(\.id)))) }
         report.hreflang = await hreflangAudit(records)
-        let badHreflang = report.hreflang.filter { ($0.status ?? 0) / 100 != 2 || $0.finalURL != $0.target }
+        let badHreflang = report.hreflang.filter { ($0.status ?? 0) / 100 != 2 || !$0.resolvesToDeclaredTarget }
         let missingReturns = report.hreflang.filter { $0.returnLinkCheckable && !$0.reciprocal }
         let invalidCodes = report.hreflang.filter { !$0.validCode }
         let noSelf = report.hreflang.filter { !$0.selfReference }.map(\.source)

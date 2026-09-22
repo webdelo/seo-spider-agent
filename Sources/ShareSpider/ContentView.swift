@@ -1070,6 +1070,87 @@ struct BacklinksView: View {
             return donorMatches && anchorMatches && linkMatches
         }
     }
+
+    /// The export deliberately follows the exact view filters. DataForSEO is
+    /// page-level, while the other providers currently expose donor-domain
+    /// evidence only; keeping that distinction in the file avoids inventing
+    /// anchors or URLs that those providers have not supplied.
+    private var filteredBacklinkExportRows: [[String]] {
+        let ahrefs = model.ahrefsBacklinkImport
+        let ahrefsDomains = Set((ahrefs?.domains ?? []).map(GSCBacklinkImportService.normalizedDomain))
+        let ahrefsSpamDomains = Set((ahrefs?.spamDomains ?? []).map(GSCBacklinkImportService.normalizedDomain))
+        let ubersuggestDomains = Set((model.ubersuggestBacklinkImport?.domains ?? []).map(GSCBacklinkImportService.normalizedDomain))
+        let ubersuggestSpamDomains = Set((model.ubersuggestBacklinkImport?.spamDomains ?? []).map(GSCBacklinkImportService.normalizedDomain))
+        let gscDonors = model.gscBacklinkImport?.donors ?? []
+        let gscDomains = Set(gscDonors.map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) })
+        let gscLinksByDomain = gscDonors.reduce(into: [String: Int]()) { result, donor in
+            let domain = GSCBacklinkImportService.normalizedDomain(donor.sourceDomain)
+            guard !domain.isEmpty else { return }
+            result[domain, default: 0] += donor.links
+        }
+
+        return sources.map { item in
+            let domain = GSCBacklinkImportService.normalizedDomain(item.sourceDomain)
+            let inAhrefs = ahrefsDomains.contains(domain)
+            let inUbersuggest = ubersuggestDomains.contains(domain)
+            let inGSC = gscDomains.contains(domain)
+            var providers = ["DataForSEO"]
+            if inAhrefs { providers.append("Ahrefs") }
+            if inUbersuggest { providers.append("Ubersuggest") }
+            if inGSC { providers.append("Google Search Console") }
+
+            return [
+                item.isLost ? "Lost" : "Active",
+                BacklinkClassifier.donorType(for: item).rawValue,
+                BacklinkClassifier.evidence(for: item),
+                BacklinkClassifier.anchorType(for: item, target: model.startText).rawValue,
+                providers.joined(separator: " | "),
+                item.sourceURL,
+                domain,
+                item.sourceTitle,
+                item.sourceStatusCode == 0 ? "" : String(item.sourceStatusCode),
+                item.targetURL,
+                item.anchor,
+                item.dofollow ? "Dofollow" : "Nofollow",
+                item.linkType,
+                item.semanticLocation,
+                item.domainRank == 0 ? "" : String(item.domainRank),
+                item.pageRank == 0 ? "" : String(item.pageRank),
+                item.spamScore == 0 ? "" : String(item.spamScore),
+                item.firstSeen,
+                item.previousSeen,
+                item.lastSeen,
+                item.broken ? "Yes" : "No",
+                item.relatedDomainZone ? "Yes" : "No",
+                item.hreflangLinksToTarget ? "Yes" : "No",
+                item.platformTypes.joined(separator: " | "),
+                inAhrefs ? "Yes" : "No",
+                ahrefs?.domainRatings[domain].map { String(format: "%.1f", $0) } ?? "",
+                ahrefsSpamDomains.contains(domain) ? "Yes" : "No",
+                inUbersuggest ? "Yes" : "No",
+                ubersuggestSpamDomains.contains(domain) ? "Yes" : "No",
+                inGSC ? "Yes" : "No",
+                gscLinksByDomain[domain].map(String.init) ?? ""
+            ]
+        }
+    }
+
+    private func exportFilteredBacklinks() {
+        let reportStatus = statusFilter.replacingOccurrences(of: " ", with: "-")
+        URLListTransfer.export(
+            name: "Backlinks-\(reportStatus)-Links",
+            header: [
+                "Record status", "Donor type", "Classification evidence", "Anchor type", "Providers reporting donor",
+                "Source URL", "Source domain", "Source title", "Source HTTP status", "Target URL", "Anchor", "Link attribute",
+                "Provider link type", "Link location", "DataForSEO domain rank", "DataForSEO page rank", "DataForSEO spam score",
+                "First seen", "Previous seen", "Last seen", "Broken target", "Related domain zone", "hreflang link to target", "Platform types",
+                "Ahrefs reported", "Ahrefs DR", "Ahrefs spam signal", "Ubersuggest reported", "Ubersuggest spam signal",
+                "Google Search Console reported", "Google Search Console link count"
+            ],
+            rows: filteredBacklinkExportRows,
+            site: model.startText
+        )
+    }
     private var sourcePageCount: Int { max(1, Int(ceil(Double(sources.count) / Double(sourcePageSize)))) }
     private var clampedSourcePage: Int { min(max(0, sourcePage), sourcePageCount - 1) }
     private var visibleSources: [BacklinkSourceDetail] {
@@ -1249,9 +1330,18 @@ struct BacklinksView: View {
             }
             HStack(spacing: 12) {
                 GroupBox("Record status") {
-                    Picker("", selection: $statusFilter) {
-                        Text("Active").tag("Active"); Text("Lost").tag("Lost"); Text("All records").tag("All records")
-                    }.labelsHidden().frame(width: 140)
+                    HStack(spacing: 8) {
+                        Picker("", selection: $statusFilter) {
+                            Text("Active").tag("Active"); Text("Lost").tag("Lost"); Text("All records").tag("All records")
+                        }.labelsHidden().frame(width: 140)
+                        Button {
+                            exportFilteredBacklinks()
+                        } label: {
+                            Label("Export", systemImage: "square.and.arrow.down")
+                        }
+                        .help("Export the links matching the current status, donor, anchor and link-attribute filters.")
+                        .disabled(sources.isEmpty)
+                    }
                 }
                 GroupBox("Anchor type") {
                     FlowLayout(spacing: 7) {

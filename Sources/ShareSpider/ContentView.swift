@@ -1029,6 +1029,15 @@ struct BacklinksView: View {
             values[domain] = max(values[domain] ?? 0, item.domainRank)
         }
     }
+    private var activeDataForSEOTypes: [String: String] {
+        let priority: [BacklinkClassifier.DonorType] = [.spam, .pbn, .web20, .catalog, .profile, .crowd, .article, .homepage, .redirect, .internationalNetwork, .unknown]
+        let grouped = Dictionary(grouping: activeLinks) { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) }
+        return grouped.reduce(into: [:]) { values, entry in
+            guard !entry.key.isEmpty else { return }
+            let types = Set(entry.value.map { BacklinkClassifier.donorType(for: $0) })
+            values[entry.key] = (priority.first { types.contains($0) } ?? .unknown).rawValue
+        }
+    }
     private var dataForSEOStats: BacklinkSourceStats { BacklinkSourceStats.dataForSEO(model.backlinkSourceDetails) }
     private var ahrefsStats: BacklinkSourceStats {
         model.ahrefsSourceStats.donors > 0
@@ -1152,6 +1161,7 @@ struct BacklinksView: View {
                     BacklinkComparisonDashboard(
                         dataForSEO: [],
                         dataForSEORanks: [:],
+                        dataForSEOTypes: [:],
                         ahrefs: Set(model.ahrefsBacklinkImport?.domains ?? []),
                         ahrefsRatings: model.ahrefsBacklinkImport?.domainRatings ?? [:],
                         ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
@@ -1214,6 +1224,7 @@ struct BacklinksView: View {
             BacklinkComparisonDashboard(
                 dataForSEO: Set(activeLinks.map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) }.filter { !$0.isEmpty }),
                 dataForSEORanks: activeDataForSEORanks,
+                dataForSEOTypes: activeDataForSEOTypes,
                 ahrefs: Set(model.ahrefsBacklinkImport?.domains ?? []),
                 ahrefsRatings: model.ahrefsBacklinkImport?.domainRatings ?? [:],
                 ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
@@ -1349,23 +1360,25 @@ private struct BacklinkSourceProgressRow: View {
 
     private var safeTotal: Int { max(1, total) }
     private var safeCompleted: Int { min(max(0, completed), safeTotal) }
+    private var showsIndeterminateProgress: Bool { isRunning && (total <= 0 || completed <= 0 || isClassifying) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Text(title).font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(safeCompleted) / \(safeTotal)")
+                Text(showsIndeterminateProgress ? "Preparing…" : "\(safeCompleted) / \(safeTotal)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            ProgressView(value: Double(safeCompleted), total: Double(safeTotal))
-                .tint(tint)
-                // A slow meditative pulse while donor pages are classified, so
-                // the user can see the analysis is alive even without a
-                // changing counter.
-                .opacity(isClassifying && pulsing ? 0.45 : 1)
-                .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: pulsing)
+            if showsIndeterminateProgress {
+                ProgressView().controlSize(.small).tint(tint)
+            } else {
+                ProgressView(value: Double(safeCompleted), total: Double(safeTotal))
+                    .tint(tint)
+                    .opacity(isClassifying && pulsing ? 0.45 : 1)
+                    .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: pulsing)
+            }
             Text(message.isEmpty ? (isRunning ? "Starting…" : "Ready") : message)
                 .font(.caption)
                 .foregroundStyle(isRunning ? .primary : .secondary)
@@ -1446,6 +1459,7 @@ private struct SourceProfileHistoryChart: View {
 private struct BacklinkComparisonDashboard: View {
     let dataForSEO: Set<String>
     let dataForSEORanks: [String: Int]
+    let dataForSEOTypes: [String: String]
     let ahrefs: Set<String>
     let ahrefsRatings: [String: Double]
     let ubersuggest: Set<String>
@@ -1478,7 +1492,7 @@ private struct BacklinkComparisonDashboard: View {
                     DomainOverlapPanel(title: "DataForSEO × Ubersuggest × Search Console", segments: triple())
                 }
                 if !dataForSEO.isEmpty || !ahrefs.isEmpty || !ubersuggest.isEmpty || !searchConsole.isEmpty {
-                    ReferringDomainSourceTable(dataForSEO: dataForSEO, dataForSEORanks: dataForSEORanks, ahrefs: ahrefs, ahrefsRatings: ahrefsRatings, ubersuggest: ubersuggest, searchConsole: searchConsole)
+                    ReferringDomainSourceTable(dataForSEO: dataForSEO, dataForSEORanks: dataForSEORanks, dataForSEOTypes: dataForSEOTypes, ahrefs: ahrefs, ahrefsRatings: ahrefsRatings, ubersuggest: ubersuggest, searchConsole: searchConsole)
                 }
             }
         }
@@ -1511,6 +1525,7 @@ private struct ReferringDomainSourceRow: Identifiable {
     let domain: String
     let ahrefsDR: Double?
     let dataForSEORank: Int?
+    let donorType: String
     let inAhrefs: Bool
     let inDataForSEO: Bool
     let inUbersuggest: Bool
@@ -1523,6 +1538,7 @@ private struct ReferringDomainSourceRow: Identifiable {
 private struct ReferringDomainSourceTable: View {
     let dataForSEO: Set<String>
     let dataForSEORanks: [String: Int]
+    let dataForSEOTypes: [String: String]
     let ahrefs: Set<String>
     let ahrefsRatings: [String: Double]
     let ubersuggest: Set<String>
@@ -1535,6 +1551,7 @@ private struct ReferringDomainSourceTable: View {
                 domain: domain,
                 ahrefsDR: ahrefsRatings[domain],
                 dataForSEORank: dataForSEORanks[domain],
+                donorType: dataForSEOTypes[domain] ?? "Не определено",
                 inAhrefs: ahrefs.contains(domain),
                 inDataForSEO: dataForSEO.contains(domain),
                 inUbersuggest: ubersuggest.contains(domain),
@@ -1559,6 +1576,9 @@ private struct ReferringDomainSourceTable: View {
                     TableColumn("DataForSEO DR") { row in
                         Text(row.dataForSEORank.map(String.init) ?? "—").monospacedDigit()
                     }.width(105)
+                    TableColumn("Link type") { row in
+                        Text(row.donorType).lineLimit(1)
+                    }.width(min: 115, ideal: 150)
                     TableColumn("Ahrefs") { sourceMark($0.inAhrefs) }.width(68)
                     TableColumn("DataForSEO") { sourceMark($0.inDataForSEO) }.width(100)
                     TableColumn("Ubersuggest") { sourceMark($0.inUbersuggest) }.width(100)

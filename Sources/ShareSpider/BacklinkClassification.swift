@@ -1,4 +1,5 @@
 import Foundation
+import SwiftSoup
 
 /// Business-level backlink classification. DataForSEO supplies the raw facts
 /// (platform, rank, URL, anchor and spam score); this layer turns them into the
@@ -16,6 +17,7 @@ enum BacklinkClassifier {
         case spam = "Spam"
         case homepage = "Главная"
         case redirect = "Редирект"
+        case internationalNetwork = "Международная / языковая сетка"
         case unknown = "Не определено"
     }
 
@@ -43,7 +45,7 @@ enum BacklinkClassifier {
     }
 
     private static func bundledRules() -> [String: [String]] {
-        guard let url = Bundle.module.url(forResource: "backlink-classification-rules", withExtension: "json"),
+        guard let url = AppResources.url(forResource: "backlink-classification-rules", withExtension: "json"),
               let data = try? Data(contentsOf: url),
               let result = try? JSONDecoder().decode([String: [String]].self, from: data) else { return [:] }
         return result
@@ -116,6 +118,7 @@ enum BacklinkClassifier {
 
     static func donorType(for item: BacklinkSourceDetail) -> DonorType {
         let source = normalized(item.sourceURL + " " + item.sourceTitle + " " + item.sourceDomain)
+        if item.relatedDomainZone && item.hreflangLinksToTarget { return .internationalNetwork }
         if item.broken || item.sourceStatusCode >= 300 { return .redirect }
         if item.spamScore >= 50 || matches(source, rules["spam"] ?? []) { return .spam }
         if matches(source, rules["pbn"] ?? []) { return .pbn }
@@ -150,6 +153,7 @@ enum BacklinkClassifier {
         case .spam: return "DataForSEO spam score \(item.spamScore)"
         case .redirect: return item.broken ? "broken backlink" : "source HTTP \(item.sourceStatusCode)"
         case .homepage: return "source URL is the domain homepage"
+        case .internationalNetwork: return "same-name domain on another zone links to target via hreflang"
         default: return "URL/title/platform heuristic"
         }
     }
@@ -169,5 +173,45 @@ enum BacklinkClassifier {
     private static func isHomepage(_ value: String) -> Bool {
         guard let url = URL(string: value) else { return false }
         return url.path.isEmpty || url.path == "/"
+    }
+}
+
+/// Donor pages are fetched only for likely same-brand, different-TLD domains.
+/// A confirmed hreflang link to the target makes the classification evidence-
+/// based instead of relying solely on a matching domain name.
+enum HreflangDonorInspector {
+    static func inspect(_ sources: [BacklinkSourceDetail], target: String) async -> [BacklinkSourceDetail] {
+        guard let targetHost = URL(string: target)?.host?.lowercased() else { return sources }
+        let candidateIDs = Set(sources.enumerated().compactMap { index, source in
+            sameNameDifferentZone(source.sourceDomain, targetHost) ? index : nil
+        })
+        guard !candidateIDs.isEmpty else { return sources }
+        let session = URLSession(configuration: .ephemeral)
+        return await withTaskGroup(of: (Int, Bool).self, returning: [BacklinkSourceDetail].self) { group in
+            for index in candidateIDs {
+                let source = sources[index]
+                group.addTask {
+                    guard let url = URL(string: source.sourceURL) else { return (index, false) }
+                    var request = URLRequest(url: url); request.timeoutInterval = 8
+                    guard let (data, _) = try? await session.data(for: request), let html = String(data: data, encoding: .utf8), let doc = try? SwiftSoup.parse(html, url.absoluteString) else { return (index, false) }
+                    let hrefs = (try? doc.select("link[hreflang][href]").array().map { try $0.absUrl("href") }) ?? []
+                    return (index, hrefs.contains { URL(string: $0)?.host?.lowercased() == targetHost })
+                }
+            }
+            var updated = sources
+            for await (index, linked) in group {
+                updated[index].relatedDomainZone = true
+                updated[index].hreflangLinksToTarget = linked
+            }
+            return updated
+        }
+    }
+
+    private static func sameNameDifferentZone(_ source: String, _ target: String) -> Bool {
+        let clean: (String) -> String = { $0.lowercased().replacingOccurrences(of: "www.", with: "") }
+        let sourceHost = clean(URL(string: source)?.host ?? source)
+        let targetHost = clean(target)
+        guard sourceHost != targetHost else { return false }
+        return sourceHost.split(separator: ".").first == targetHost.split(separator: ".").first
     }
 }

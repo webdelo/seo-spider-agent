@@ -12,8 +12,8 @@ enum AuditScanner {
     static func run(startURL: URL, records: [CrawlRecord]) async -> AuditReport {
         var report = AuditReport()
         guard let host = startURL.host else { return report }
-        async let ahrefs = SiteDiagnostics.domainRating(host: host)
         async let resolvedIPs = SiteDiagnostics.resolveIPs(host: host)
+        async let ahrefsRating = SiteDiagnostics.domainRating(host: host)
         async let sitemap = SitemapLoader.discover(for: startURL, session: .shared)
         report.robots = await robotsAudit(startURL)
         let blocked = records.filter { !$0.robotsBlockedBy.isEmpty }
@@ -110,10 +110,10 @@ enum AuditScanner {
         if !duplicateCodes.isEmpty { report.findings.append(AuditFinding(title: "Duplicate hreflang codes", severity: "Medium", detail: "A source page contains multiple entries for the same language or region.", urlIDs: Set(records.filter { page in duplicateCodes.contains { $0.source == page.url } }.map(\.id)))) }
         if !hreflangConflicts.isEmpty { report.findings.append(AuditFinding(title: "Conflicting hreflang language versions", severity: "High", detail: "The same language code points to different alternate URLs.", urlIDs: Set(records.filter { page in hreflangConflicts.contains { $0.source == page.url } }.map(\.id)))) }
         if !languageMismatch.isEmpty { report.findings.append(AuditFinding(title: "Hreflang does not match target language", severity: "Medium", detail: "The alternate hreflang code differs from the target page html lang value.", urlIDs: Set(records.filter { page in languageMismatch.contains { $0.source == page.url } }.map(\.id)))) }
-        let dr = await ahrefs
-        report.siteProfile.domainRating = dr.value
-        report.siteProfile.domainRatingError = dr.error
         report.siteProfile.ipAddresses = await resolvedIPs
+        let ahrefs = await ahrefsRating
+        report.siteProfile.domainRating = ahrefs.value
+        report.siteProfile.domainRatingError = ahrefs.error
         let cms = pages.filter { $0.cmsName != "Unknown" }.reduce(into: [String: (count: Int, confidence: Double, evidence: [String])]()) { values, page in
             var current = values[page.cmsName] ?? (0, 0, [])
             current.count += 1; current.confidence = max(current.confidence, page.cmsConfidence)

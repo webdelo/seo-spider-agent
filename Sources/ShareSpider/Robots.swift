@@ -4,14 +4,13 @@ struct RobotsDirective: Sendable { var agent: String; var directive: String; var
 
 struct RobotsRules: Sendable {
     var directives: [RobotsDirective] = []
-    var crawlDelay: TimeInterval = 0
+    var crawlDelays: [String: TimeInterval] = [:]
     var sitemaps: [URL] = []
 
-    /// Googlebot-specific groups have priority. If no Googlebot group exists,
-    /// the crawler falls back to `User-agent: *`, mirroring Google's robots
-    /// group selection instead of merging the two rule sets.
-    func blockingRule(for url: URL) -> String? {
-        let preferredAgent = directives.contains { $0.agent == "googlebot" } ? "googlebot" : "*"
+    /// Use the directives that match the actual request User-Agent. This avoids
+    /// treating Googlebot-only robots rules as ShareSpider's own crawl policy.
+    func blockingRule(for url: URL, userAgent: String) -> String? {
+        let preferredAgent = matchingAgent(for: userAgent)
         let matches = directives.filter { $0.agent == preferredAgent && ruleMatches(path: url.path, pattern: $0.value) }
         guard let winner = matches.sorted(by: { lhs, rhs in
             if lhs.value.count == rhs.value.count { return lhs.directive == "allow" && rhs.directive == "disallow" }
@@ -20,7 +19,13 @@ struct RobotsRules: Sendable {
         return "Disallow: \(winner.value)"
     }
 
-    func allows(_ url: URL) -> Bool { blockingRule(for: url) == nil }
+    func allows(_ url: URL, userAgent: String) -> Bool { blockingRule(for: url, userAgent: userAgent) == nil }
+    func crawlDelay(for userAgent: String) -> TimeInterval { crawlDelays[matchingAgent(for: userAgent)] ?? 0 }
+
+    private func matchingAgent(for userAgent: String) -> String {
+        let lower = userAgent.lowercased()
+        return directives.map(\.agent).filter { $0 != "*" && lower.contains($0) }.max(by: { $0.count < $1.count }) ?? "*"
+    }
 
     private func ruleMatches(path: String, pattern raw: String) -> Bool {
         guard !raw.isEmpty else { return false }
@@ -45,7 +50,8 @@ struct RobotsRules: Sendable {
                 sectionHasDirective = true
                 guard !parts[1].isEmpty else { continue }
                 for agent in agents { result.directives.append(RobotsDirective(agent: agent, directive: String(parts[0]).lowercased(), value: parts[1])) }
-            case "crawl-delay" where agents.contains("googlebot") || agents.contains("*"): result.crawlDelay = TimeInterval(parts[1]) ?? 0
+            case "crawl-delay":
+                for agent in agents { result.crawlDelays[agent] = TimeInterval(parts[1]) ?? 0 }
             case "sitemap": if let url = URL(string: parts[1]) { result.sitemaps.append(url) }
             default: break
             }
@@ -70,8 +76,15 @@ private final class SitemapXMLDelegate: NSObject, XMLParserDelegate {
 /// Discovers sitemap locations from robots.txt, then falls back to /sitemap.xml.
 /// Every sitemap-index is recursively parsed, including multi-level indexes.
 enum SitemapLoader {
-    static func discover(for start: URL, session: URLSession) async -> SitemapAudit {
-        let robots = await RobotsRules.load(for: start, session: session)
+    /// An already-loaded robots file may be supplied by the crawl preflight so
+    /// sitemap discovery does not issue a second serial robots.txt request.
+    static func discover(for start: URL, session: URLSession, robots suppliedRobots: RobotsRules? = nil) async -> SitemapAudit {
+        let robots: RobotsRules
+        if let suppliedRobots {
+            robots = suppliedRobots
+        } else {
+            robots = await RobotsRules.load(for: start, session: session)
+        }
         let roots: [URL]
         if robots.sitemaps.isEmpty, var parts = URLComponents(url: start, resolvingAgainstBaseURL: false) {
             parts.path = "/sitemap.xml"; parts.query = nil; roots = parts.url.map { [$0] } ?? []
@@ -119,4 +132,11 @@ enum SitemapLoader {
 final class CrawlRedirectObserver: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     var chain: [URL] = []; var codes: [Int] = []
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) { codes.append(response.statusCode); if let u = request.url { chain.append(u) }; completionHandler(request) }
+    /// URLSession gives `Data` after gzip/Brotli decoding. Task metrics retain
+    /// the on-the-wire response-body byte count, which is what users mean by
+    /// transfer weight.
+    var responseBodyBytesReceived = 0
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        responseBodyBytesReceived = metrics.transactionMetrics.reduce(0) { $0 + Int($1.countOfResponseBodyBytesReceived) }
+    }
 }

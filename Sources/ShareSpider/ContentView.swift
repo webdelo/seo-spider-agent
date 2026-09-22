@@ -1,13 +1,31 @@
 import SwiftUI
 import AppKit
+import Charts
+
+/// Toolbar views can be recomputed many times while macOS restores a window.
+/// Resolving a package resource from `body` made that restoration loop spend
+/// every pass opening the bundle again, delaying the first interactive frame.
+@MainActor
+private enum BrandAssets {
+    static let overviewLogo: NSImage? = {
+        // SwiftPM's resource `Bundle` lookup can re-enter AppKit while its
+        // initial `Window` is being created. Resolve the known installed path
+        // directly instead, just like the Chrome helpers do.
+        guard let resources = Bundle.main.resourceURL else { return nil }
+        let url = resources
+            .appendingPathComponent("SEOSpiderAgent_ShareSpider.bundle", isDirectory: true)
+            .appendingPathComponent("overview-logo-cropped.png")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return NSImage(contentsOf: url)
+    }()
+}
 
 struct BrandLogo: View {
     let width: CGFloat
     let height: CGFloat
 
     var body: some View {
-        if let url = Bundle.module.url(forResource: "overview-logo-cropped", withExtension: "png"),
-           let image = NSImage(contentsOf: url) {
+        if let image = BrandAssets.overviewLogo {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
@@ -24,6 +42,30 @@ struct BrandLogo: View {
 struct URLActions: View {
     let url: URL
     var body: some View { HStack(spacing: 6) { Button { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(url.absoluteString, forType: .string) } label: { Image(systemName: "doc.on.doc") }.buttonStyle(.plain).help("Copy URL"); Button { NSWorkspace.shared.open(url) } label: { Image(systemName: "arrow.up.forward.app") }.buttonStyle(.plain).help("Open in browser") } }
+}
+
+/// Shared clipboard and CSV actions for the two URL lists. Clipboard output is
+/// deliberately one URL per line so it can be pasted straight into a sheet.
+private enum URLListTransfer {
+    @MainActor
+    static func copy(_ urls: [String]) {
+        let text = Array(Set(urls.filter { !$0.isEmpty })).sorted().joined(separator: "\n")
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    @MainActor
+    static func export(name: String, header: [String], rows: [[String]]) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = name
+        panel.canCreateDirectories = true
+        panel.directoryURL = ReportFileNaming.downloadsDirectory
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        func csv(_ value: String) -> String { "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\"" }
+        let text = ([header] + rows).map { $0.map(csv).joined(separator: ",") }.joined(separator: "\n") + "\n"
+        try? text.write(to: destination, atomically: true, encoding: .utf8)
+    }
 }
 
 struct ScenariosView: View {
@@ -357,6 +399,7 @@ struct ProjectJournalView: View {
 
 struct ContentView: View {
     @StateObject private var model = CrawlViewModel()
+    @EnvironmentObject private var licence: LicenseManager
     @State private var tab = 0
     @State private var showSettings = false
     @State private var showScenarios = false
@@ -380,6 +423,7 @@ struct ContentView: View {
         .sheet(isPresented: $showScenarios) { ScenariosView(model: model, store: scenarios) }
         .sheet(isPresented: $showProjects) { ProjectJournalView(model: model, journal: projectJournal) }
         .task {
+            model.licenseManager = licence
             if let pendingCommand = AutomationBridge.consumePendingCommand() {
                 model.handleLaunchURL(pendingCommand)
             }
@@ -428,7 +472,7 @@ struct ContentView: View {
                     Text("List mode uses the URL list below.").foregroundStyle(.secondary)
                     Button("Import TXT / CSV") { model.importList() }
                 }
-                Button { model.start() } label: { Label(model.state == .paused ? "Resume" : "Start", systemImage: "play.fill") }.buttonStyle(.borderedProminent).disabled(model.state == .crawling)
+                Button { model.start() } label: { Label(model.licenseCheckRunning ? "Checking licence…" : (model.state == .paused ? "Resume" : "Start"), systemImage: "play.fill") }.buttonStyle(.borderedProminent).disabled(model.state == .crawling || model.backlinkProfileAnalysisRunning || model.licenseCheckRunning)
                 Button { model.pause() } label: { Label("Pause", systemImage: "pause.fill") }.disabled(model.state != .crawling)
                 Button { model.stop() } label: { Label("Stop", systemImage: "stop.fill") }.disabled(model.state != .crawling && model.state != .paused)
                 Button { model.clear() } label: { Label("Clear", systemImage: "trash") }
@@ -456,6 +500,21 @@ struct ContentView: View {
                 }
             }
             // Site-wide Chrome reports and URL Inspection are independent from
+            if model.state == .crawling || model.state == .finished {
+                HStack {
+                    Text("HTTP: \(model.stageProgress.htmlCompleted) · queued \(model.queued) · \(model.stageProgress.htmlFinished ? "complete" : "running")")
+                    Spacer()
+                    Text("Page Weight: \(model.stageProgress.weightCompleted) / \(model.stageProgress.weightTotal) · active \(model.stageProgress.weightActive) · partial \(model.stageProgress.weightPartial)")
+                }.font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                ProgressView(value: Double(model.stageProgress.weightCompleted), total: Double(max(1, model.stageProgress.weightTotal))).tint(.orange)
+                if model.stageProgress.cdpQueued > 0 || model.stageProgress.cdpPrimary > 0 || model.stageProgress.crawlerThrottle > 0 || model.stageProgress.transportMode != "normal HTTP" {
+                    HStack {
+                        Text("Transport: \(model.stageProgress.transportMode) · Chrome fallback \(model.stageProgress.cdpCompleted) / \(model.stageProgress.cdpQueued) · verified \(model.stageProgress.cdpVerified) · CDP primary \(model.stageProgress.cdpPrimary)")
+                        Spacer()
+                        if model.stageProgress.crawlerThrottle > 0 { Text("temporary delay \(model.stageProgress.crawlerThrottle) ms") }
+                    }.font(.caption.monospacedDigit()).foregroundStyle(.orange)
+                }
+            }
             // crawling. Keep each status below the crawl bar so a completed
             // crawl is never mistaken for a completed Google import.
             if model.gscChromeSyncRunning {
@@ -580,7 +639,7 @@ struct AffectedURLsView: View {
                 Text("\(model.overviewSelectionExternalURLs.count) URL\(model.overviewSelectionExternalURLs.count == 1 ? "" : "s") reported by Google Search Console")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                GSCReportedURLList(urls: model.overviewSelectionExternalURLs, crawled: model.records)
+                GSCReportedURLList(urls: model.overviewSelectionExternalURLs, crawled: model.records, exportName: "SEOSpiderAgent-\(metric.replacingOccurrences(of: "/", with: "-"))-GSC-URLs.csv")
             } else {
                 Text("\(records.count) URL\(records.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
                 if records.isEmpty && metric.hasPrefix("GSC") {
@@ -590,12 +649,46 @@ struct AffectedURLsView: View {
                         description: Text("Google supplied the category total but did not provide individual URLs in this report. The existing crawl data is not replaced.")
                     )
                 } else {
-                    ProblemExampleList(problemName: metric, records: records)
+                    AffectedCrawlRecordList(records: records, exportName: "SEOSpiderAgent-\(metric.replacingOccurrences(of: "/", with: "-"))-URLs.csv")
                     Button("Open filtered table in URLs") { showURLs() }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
         }
         .padding(.trailing, 8)
+    }
+}
+
+/// A compact, selectable table for one Overview metric. It intentionally
+/// shows only pages attached to that metric, never the rest of the audit.
+private struct AffectedCrawlRecordList: View {
+    let records: [CrawlRecord]
+    let exportName: String
+    @State private var selection = Set<CrawlRecord.ID>()
+
+    private var selectedRecords: [CrawlRecord] { records.filter { selection.contains($0.id) } }
+    private var exportRows: [[String]] {
+        records.map { [$0.url.absoluteString, $0.statusText, $0.title, $0.displayPageType] }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Button("Select all") { selection = Set(records.map(\.id)) }.disabled(records.isEmpty)
+                Button("Copy selected") { URLListTransfer.copy(selectedRecords.map { $0.url.absoluteString }) }.disabled(selectedRecords.isEmpty)
+                Button("Copy all") { URLListTransfer.copy(records.map { $0.url.absoluteString }) }.disabled(records.isEmpty)
+                Button("Export all") { URLListTransfer.export(name: exportName, header: ["URL", "Status", "Title", "Page type"], rows: exportRows) }.disabled(records.isEmpty)
+                Spacer()
+                Text("\(selectedRecords.count) selected").font(.caption).foregroundStyle(.secondary)
+            }
+            Table(records, selection: $selection) {
+                TableColumn("URL") { record in
+                    HStack { Text(record.url.absoluteString).lineLimit(1); Spacer(); URLActions(url: record.url) }
+                }.width(min: 280, ideal: 500)
+                TableColumn("Status") { Text($0.statusText) }.width(60)
+                TableColumn("Title") { Text($0.title).lineLimit(1) }.width(min: 120, ideal: 220)
+                TableColumn("Type") { Text($0.displayPageType).lineLimit(1) }.width(105)
+            }
+        }
     }
 }
 
@@ -636,6 +729,7 @@ private struct BacklinkDrilldownList: View {
 struct IssuesView: View {
     @ObservedObject var model: CrawlViewModel
     var switchToURLs: () -> Void
+    @State private var selectedIssueID: Issue.ID?
     var body: some View {
         GeometryReader { proxy in
             HStack(spacing: 0) {
@@ -653,20 +747,51 @@ struct IssuesView: View {
     private var issueTable: some View {
         VStack(alignment: .leading) {
             Text("Issues").font(.title2.weight(.semibold))
-            Table(model.issues) {
-                TableColumn("Issue Name") { issue in Text(issue.name).contentShape(Rectangle()).onTapGesture { model.selectIssue(issue) } }
+            Table(model.issues, selection: $selectedIssueID) {
+                TableColumn("Issue Name") { Text($0.name) }
                 TableColumn("Type") { Text($0.type) }
                 TableColumn("Priority") { Text($0.priority).foregroundStyle($0.priority == "High" ? .red : $0.priority == "Medium" ? .orange : .secondary) }
                 TableColumn("URLs") { Text("\($0.count)") }.width(60)
                 TableColumn("% of Total") { Text(model.records.isEmpty ? "0%" : String(format: "%.1f%%", Double($0.count) / Double(model.records.count) * 100)) }.width(100)
-            }.contextMenu(forSelectionType: Issue.ID.self) { _ in Button("Show affected URLs") { switchToURLs() } }
+            }
+            .onChange(of: selectedIssueID) { _, id in
+                guard let id, let issue = model.issues.first(where: { $0.id == id }) else { return }
+                model.selectIssue(issue)
+            }
+            .contextMenu(forSelectionType: Issue.ID.self) { _ in Button("Show affected URLs") { switchToURLs() } }
         }
     }
 }
 
 struct IssueURLsView: View {
     @ObservedObject var model: CrawlViewModel; let issue: Issue
-    var body: some View { VStack(alignment: .leading, spacing: 8) { HStack { VStack(alignment: .leading) { Text("Affected URLs").font(.title3.weight(.semibold)); Text(issue.name).foregroundStyle(.secondary).lineLimit(2) }; Spacer(); Button { model.clearIssueSelection() } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain) }; if !issue.externalURLs.isEmpty { GSCReportedURLList(urls: issue.externalURLs, crawled: model.records) } else { ProblemExampleList(problemName: issue.name, records: model.records.filter { issue.urlIDs.contains($0.id) }) } }.padding(.trailing, 8) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading) {
+                    Text("Affected URLs").font(.title3.weight(.semibold))
+                    Text(issue.name).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Spacer()
+                Button { model.clearIssueSelection() } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain)
+            }
+            if !issue.externalURLs.isEmpty {
+                GSCReportedURLList(urls: issue.externalURLs, crawled: model.records, exportName: "SEOSpiderAgent-\(issue.name.replacingOccurrences(of: "/", with: "-"))-GSC-URLs.csv")
+            } else if issue.reportedCount != nil {
+                ContentUnavailableView(
+                    "Google reported \(issue.count) URL\(issue.count == 1 ? "" : "s"), without an address list",
+                    systemImage: "list.bullet.clipboard",
+                    description: Text("The imported Search Console category contains an aggregate count only. It cannot be matched to crawl URLs without Google’s affected-URL export."))
+                Button(model.gscChromePageIndexingSyncRunning ? "Syncing GSC Page Indexing…" : "Retry GSC Page Indexing export") {
+                    model.syncGSCPageIndexingThroughChrome()
+                }
+                .disabled(model.gscChromePageIndexingSyncRunning || model.state == .crawling || model.state == .paused)
+            } else {
+                ProblemExampleList(problemName: issue.name, records: model.records.filter { issue.urlIDs.contains($0.id) })
+            }
+        }
+        .padding(.trailing, 8)
+    }
 }
 
 /// URLs exported by the Page Indexing report can include URLs that this crawl
@@ -675,17 +800,39 @@ struct IssueURLsView: View {
 struct GSCReportedURLList: View {
     let urls: [String]
     let crawled: [CrawlRecord]
+    let exportName: String
+    @State private var selection = Set<String>()
     private func record(_ value: String) -> CrawlRecord? { crawled.first { $0.url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == value.trimmingCharacters(in: CharacterSet(charactersIn: "/")) } }
+    private var selectedURLs: [String] { urls.filter { selection.contains($0) } }
     var body: some View {
-        List {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Button("Select all") { selection = Set(urls) }.disabled(urls.isEmpty)
+                Button("Copy selected") { URLListTransfer.copy(selectedURLs) }.disabled(selectedURLs.isEmpty)
+                Button("Copy all") { URLListTransfer.copy(urls) }.disabled(urls.isEmpty)
+                Button("Export all") {
+                    URLListTransfer.export(
+                        name: exportName,
+                        header: ["URL", "Current status", "Title", "Page type"],
+                        rows: urls.map { value in
+                            let current = record(value)
+                            return [value, current?.statusText ?? "Not found in current crawl", current?.title ?? "", current?.displayPageType ?? ""]
+                        }
+                    )
+                }.disabled(urls.isEmpty)
+                Spacer()
+                Text("\(selectedURLs.count) selected").font(.caption).foregroundStyle(.secondary)
+            }
+            List(selection: $selection) {
             ForEach(urls, id: \.self) { value in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack { Text(value).lineLimit(2).textSelection(.enabled); Spacer(); if let url = URL(string: value) { URLActions(url: url) } }
                     if let current = record(value) {
-                        Text("ShareSpider now: \(current.statusText) · \(current.indexability)\(current.canonical.isEmpty ? "" : " · canonical: \(current.canonical)")")
+                        Text("ShareSpider now: \(current.statusText) · \(current.indexability) · source: \(current.transportLabel)\(current.canonical.isEmpty ? "" : " · canonical: \(current.canonical)")")
                             .font(.caption).foregroundStyle((current.statusCode ?? 0) / 100 == 2 ? .green : .orange).lineLimit(2)
                     } else { Text("Not found in the current crawl.").font(.caption).foregroundStyle(.secondary) }
                 }
+            }
             }
         }
     }
@@ -702,6 +849,7 @@ struct ProblemExampleList: View {
     private var isEmbeddedImageProblem: Bool { isImageAltProblem || problemName == "Images over 100 KB" || problemName == "Over 100 KB" }
     private var isImageResourceProblem: Bool { problemName == "Broken image resources" || problemName == "Heavy image resources" || problemName == "Broken Image Resources" || problemName == "Heavy Image Resources" }
     private var isRedirectProblem: Bool { problemName.localizedCaseInsensitiveContains("redirect") }
+    private var isPageMetricsProblem: Bool { problemName.localizedCaseInsensitiveContains("page weight") || problemName.localizedCaseInsensitiveContains("ai:") }
     private var isSchemaProblem: Bool { problemName.localizedCaseInsensitiveContains("schema") || problemName.localizedCaseInsensitiveContains("structured data") || ["Organization / Business", "BreadcrumbList", "Product", "Review", "FAQPage", "WebSite", "WebPage", "Service", "Person", "VideoObject", "Event", "JobPosting"].contains(problemName) }
     var body: some View {
         List {
@@ -734,12 +882,28 @@ struct ProblemExampleList: View {
                         if isSchemaProblem { Text(record.schemaTypes.isEmpty ? "JSON-LD schema not found" : "JSON-LD: \(record.schemaTypes.joined(separator: ", "))").lineLimit(3).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                         else if isRedirectProblem, let source = record.redirectSources.first { Text("Redirect: \(source.absoluteString) → \(record.url.absoluteString)").lineLimit(3).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
                         else if isTitleProblem { Text(record.title.isEmpty ? "Title is missing" : record.title).lineLimit(3).textSelection(.enabled); Text("Title length: \(record.title.count) characters").font(.caption).foregroundStyle(.secondary) }
-                        else if isImageResourceProblem { HStack(spacing: 8) { Text(record.statusText); Text(record.contentType); if record.size > 0 { Text(ByteCountFormatter.string(fromByteCount: Int64(record.size), countStyle: .file)) } }.font(.caption).foregroundStyle(record.statusCode.map { $0 >= 400 } == true ? .red : .secondary) }
-                        else { HStack(spacing: 8) { Text(record.statusText); if !record.title.isEmpty { Text(record.title).lineLimit(1) } }.font(.caption).foregroundStyle(.secondary) }
-                        if expandedFoundOn.contains(record.id) { FoundOnLinks(urls: record.foundOnURLs) }
+                        else if isImageResourceProblem { HStack(spacing: 8) { Text(record.statusText); Text(record.transportLabel); Text(record.contentType); if record.size > 0 { Text(ByteCountFormatter.string(fromByteCount: Int64(record.size), countStyle: .file)) } }.font(.caption).foregroundStyle(record.statusCode.map { $0 >= 400 } == true ? .red : .secondary) }
+                        else if isPageMetricsProblem { PageMetricsCompactLine(record: record) }
+                        else { HStack(spacing: 8) { Text(record.statusText); Text(record.transportLabel).foregroundStyle(record.transportUsed == "cdp" ? .blue : .secondary); if !record.title.isEmpty { Text(record.title).lineLimit(1) } }.font(.caption).foregroundStyle(.secondary) }
+                        if !isPageMetricsProblem && expandedFoundOn.contains(record.id) { FoundOnLinks(urls: record.foundOnURLs) }
                     }.contextMenu { Button("Open in browser") { NSWorkspace.shared.open(record.url) }; Button("Copy URL") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(record.url.absoluteString, forType: .string) } }
                 }
             }
+        }
+    }
+}
+
+private struct PageMetricsCompactLine: View {
+    let record: CrawlRecord
+    private func size(_ value: Int) -> String { ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file) }
+    var body: some View {
+        if record.aiParsability != "AI Friendly" && record.aiParsability != "Not assessed" {
+            Text("HTML \(size(record.htmlSize)) · recommended ≤ 600 KB · \(record.estimatedHTMLTokens / 1_000)K tokens, DOM \(record.domNodeCount), inline JS \(size(record.inlineJavaScriptSize)), JSON \(size(record.embeddedJSONSize)), content ratio \(Int(record.contentToHTMLRatio * 100))%")
+                .font(.caption).foregroundStyle(.orange).lineLimit(2).textSelection(.enabled)
+        } else {
+            let transfer = record.transferredSize > 0 ? "Transferred \(size(record.transferredSize))\(record.contentEncoding.isEmpty ? "" : " (\(record.contentEncoding))") · " : ""
+            Text("\(transfer)decoded HTML \(size(record.htmlSize)) · Images \(size(record.imageResourceSize)), JS \(size(record.javascriptResourceSize)), CSS \(size(record.cssResourceSize))")
+                .font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
         }
     }
 }
@@ -772,6 +936,8 @@ struct BacklinksView: View {
     @State private var linkFilter = "All links"
     @State private var statusFilter = "Active"
 
+    private var crawlIsActive: Bool { model.state == .crawling || model.state == .paused }
+
     private var statusScopedLinks: [BacklinkSourceDetail] {
         switch statusFilter {
         case "Lost": return model.backlinkSourceDetails.filter(\.isLost)
@@ -781,6 +947,30 @@ struct BacklinksView: View {
     }
     private var activeLinks: [BacklinkSourceDetail] { model.backlinkSourceDetails.filter { !$0.isLost } }
     private var lostLinks: [BacklinkSourceDetail] { model.backlinkSourceDetails.filter(\.isLost) }
+    private var activeDataForSEORanks: [String: Int] {
+        model.backlinkSourceDetails.filter { !$0.isLost }.reduce(into: [:]) { values, item in
+            let domain = GSCBacklinkImportService.normalizedDomain(item.sourceDomain)
+            guard !domain.isEmpty else { return }
+            values[domain] = max(values[domain] ?? 0, item.domainRank)
+        }
+    }
+    private var dataForSEOStats: BacklinkSourceStats { BacklinkSourceStats.dataForSEO(model.backlinkSourceDetails) }
+    private var ahrefsStats: BacklinkSourceStats {
+        model.ahrefsSourceStats.donors > 0
+            ? model.ahrefsSourceStats
+            : BacklinkSourceStats.domains(model.ahrefsBacklinkImport?.domains ?? [], links: model.ahrefsBacklinkImport?.linkCount, knownSpam: Set(model.ahrefsBacklinkImport?.spamDomains ?? []))
+    }
+    private var ubersuggestStats: BacklinkSourceStats {
+        model.ubersuggestSourceStats.donors > 0
+            ? model.ubersuggestSourceStats
+            : BacklinkSourceStats.domains(model.ubersuggestBacklinkImport?.domains ?? [], links: model.ubersuggestBacklinkImport?.linkCount, knownSpam: Set(model.ubersuggestBacklinkImport?.spamDomains ?? []))
+    }
+    private var gscStats: BacklinkSourceStats {
+        let donors = model.gscBacklinkImport?.donors ?? []
+        return model.gscSourceStats.donors > 0
+            ? model.gscSourceStats
+            : BacklinkSourceStats.domains(donors.map(\.sourceDomain), links: donors.reduce(0) { $0 + max(1, $1.links) })
+    }
 
     private var sources: [BacklinkSourceDetail] {
         statusScopedLinks.filter { item in
@@ -819,45 +1009,91 @@ struct BacklinksView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Backlink Intelligence").font(.title2.weight(.semibold))
                     Text("Donor pages, anchors and practical donor-type classification.").foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button(model.backlinkDrilldownRunning ? "Loading…" : "Load active links & history") {
-                    model.loadBacklinkSourceAnalysis()
+                Button(model.backlinkProfileAnalysisRunning ? "Running backlink profile…" : "Run backlink profile analysis") {
+                    model.runBacklinkProfileAnalysis()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.backlinkDrilldownRunning || model.records.isEmpty)
+                .disabled(crawlIsActive || model.backlinkProfileAnalysisRunning || model.startText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button(model.backlinkDrilldownRunning ? "Loading DataForSEO…" : "Load DataForSEO data") {
+                    model.loadBacklinkSourceAnalysis()
+                }
+                .buttonStyle(.bordered)
+                .disabled(crawlIsActive || model.backlinkDrilldownRunning)
                 Button("Import GSC links CSV") { model.importGSCBacklinkCSV() }
-                    .disabled(model.backlinkDrilldownRunning || model.gscChromeLinkSyncRunning)
+                    .disabled(crawlIsActive || model.backlinkDrilldownRunning || model.gscChromeLinkSyncRunning)
                 Button(model.gscChromeLinkSyncRunning ? "Syncing GSC links…" : "Sync GSC links via Chrome") {
                     model.syncGSCBacklinksThroughChrome()
                 }
-                .disabled(model.backlinkDrilldownRunning || model.gscChromeLinkSyncRunning)
+                .disabled(crawlIsActive || model.backlinkDrilldownRunning || model.gscChromeLinkSyncRunning)
                 .help("Exports the Google Search Console Links report through the local ShareSpider Chrome profile, then imports it as a separate comparison dataset.")
+                Button(model.ahrefsComparisonRunning ? "Loading Ahrefs…" : "Load Ahrefs data") {
+                    model.loadAhrefsReferringDomains()
+                }
+                .buttonStyle(.bordered)
+                .disabled(crawlIsActive || model.ahrefsComparisonRunning)
+                Button(model.ubersuggestComparisonRunning ? "Loading Ubersuggest…" : "Load Ubersuggest data") {
+                    model.loadUbersuggestReferringDomains()
+                }
+                .buttonStyle(.bordered)
+                .disabled(crawlIsActive || model.ubersuggestComparisonRunning)
             }
 
-            if model.backlinkDrilldownRunning {
-                HStack { ProgressView(); Text("DataForSEO is loading active and lost donor records, plus the historical trend. This does not re-crawl your site.").foregroundStyle(.secondary) }
+            if crawlIsActive {
+                Text("Backlink profile can be started after the crawl finishes, so provider checks do not slow the crawl down.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            if model.gscChromeLinkSyncRunning {
-                HStack { ProgressView(); Text("Google Search Console Links export is running in the local ShareSpider Chrome profile.").foregroundStyle(.secondary) }
+
+            GroupBox("Backlink-source progress") {
+                VStack(alignment: .leading, spacing: 9) {
+                    BacklinkSourceProgressRow(title: "DataForSEO", completed: model.backlinkProgress, total: model.backlinkTotal, message: model.dataForSEOProfileMessage, tint: .purple, isRunning: model.backlinkDrilldownRunning, stats: dataForSEOStats, history: model.backlinkHistory, isClassifying: model.dataForSEOProfileClassifying)
+                    BacklinkSourceProgressRow(title: "Ahrefs", completed: model.ahrefsComparisonProgress, total: model.ahrefsComparisonTotal, message: model.ahrefsComparisonMessage, tint: .orange, isRunning: model.ahrefsComparisonRunning || model.ahrefsProfileClassifying, stats: ahrefsStats, isClassifying: model.ahrefsProfileClassifying, isDomainLevel: true)
+                    BacklinkSourceProgressRow(title: "Ubersuggest", completed: model.ubersuggestComparisonProgress, total: model.ubersuggestComparisonTotal, message: model.ubersuggestComparisonMessage, tint: .green, isRunning: model.ubersuggestComparisonRunning || model.ubersuggestProfileClassifying, stats: ubersuggestStats, isClassifying: model.ubersuggestProfileClassifying, isDomainLevel: true)
+                    BacklinkSourceProgressRow(title: "Google Search Console · Links", completed: model.gscBacklinkProgress, total: model.gscBacklinkTotal, message: model.gscBacklinkStage, tint: .blue, isRunning: model.gscChromeLinkSyncRunning || model.gscProfileClassifying, stats: gscStats, isClassifying: model.gscProfileClassifying, isDomainLevel: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if model.backlinkSourceDetails.isEmpty {
-                ContentUnavailableView(
-                    "Load backlink sources",
-                    systemImage: "link.badge.plus",
-                    description: Text("The analysis separates active links from links explicitly marked as lost by DataForSEO, then adds annual acquisition/loss history. It also uses source URL, anchor, domain rank, follow attribute, spam score and source platform to classify donor pages."))
+                VStack(alignment: .leading, spacing: 12) {
+                    ContentUnavailableView(
+                        "Load backlink sources",
+                        systemImage: "link.badge.plus",
+                        description: Text("The analysis separates active links from links explicitly marked as lost by DataForSEO, then adds annual acquisition/loss history. It also uses source URL, anchor, domain rank, follow attribute, spam score and source platform to classify donor pages."))
+                    BacklinkComparisonDashboard(
+                        dataForSEO: [],
+                        dataForSEORanks: [:],
+                        ahrefs: Set(model.ahrefsBacklinkImport?.domains ?? []),
+                        ahrefsRatings: model.ahrefsBacklinkImport?.domainRatings ?? [:],
+                        ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
+                        searchConsole: Set(model.gscBacklinkImport?.donors.map(\.sourceDomain) ?? []),
+                        loadDataForSEO: model.loadBacklinkSourceAnalysis,
+                        loadAhrefs: model.loadAhrefsReferringDomains,
+                        loadUbersuggest: model.loadUbersuggestReferringDomains,
+                        loadSearchConsole: model.syncGSCBacklinksThroughChrome,
+                        dataForSEORunning: model.backlinkDrilldownRunning,
+                        ahrefsRunning: model.ahrefsComparisonRunning,
+                        ubersuggestRunning: model.ubersuggestComparisonRunning,
+                        searchConsoleRunning: model.gscChromeLinkSyncRunning
+                    )
+                }
             } else {
                 loadedContent
             }
             if !model.backlinkMessage.isEmpty { Text(model.backlinkMessage).font(.caption).foregroundStyle(.secondary) }
         }
         .padding()
+        .onAppear { model.loadBacklinkImportsForCurrentTarget() }
+        .onChange(of: model.startText) { _, _ in model.loadBacklinkImportsForCurrentTarget() }
+        }
     }
 
     private var loadedContent: some View {
@@ -894,6 +1130,22 @@ struct BacklinksView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            BacklinkComparisonDashboard(
+                dataForSEO: Set(activeLinks.map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) }.filter { !$0.isEmpty }),
+                dataForSEORanks: activeDataForSEORanks,
+                ahrefs: Set(model.ahrefsBacklinkImport?.domains ?? []),
+                ahrefsRatings: model.ahrefsBacklinkImport?.domainRatings ?? [:],
+                ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
+                searchConsole: Set(model.gscBacklinkImport?.donors.map(\.sourceDomain) ?? []),
+                loadDataForSEO: model.loadBacklinkSourceAnalysis,
+                loadAhrefs: model.loadAhrefsReferringDomains,
+                loadUbersuggest: model.loadUbersuggestReferringDomains,
+                loadSearchConsole: model.syncGSCBacklinksThroughChrome,
+                dataForSEORunning: model.backlinkDrilldownRunning,
+                ahrefsRunning: model.ahrefsComparisonRunning,
+                ubersuggestRunning: model.ubersuggestComparisonRunning,
+                searchConsoleRunning: model.gscChromeLinkSyncRunning
+            )
             historyView
             GroupBox("Donor page type") {
                 FlowLayout(spacing: 7) {
@@ -934,6 +1186,296 @@ struct BacklinksView: View {
     }
 
     private var historyView: some View { BacklinkHistoryView(years: yearlyHistory) }
+}
+
+/// Provider datasets are intentionally compared as domain sets, not backlink
+/// totals: a single provider can report many links from the same donor while
+/// another reports only one. This keeps the diagram and the lists meaningful.
+private struct DomainOverlapSegment: Identifiable {
+    let label: String
+    let domains: [String]
+    var id: String { label }
+}
+
+private struct DomainOverlapPanel: View {
+    let title: String
+    let segments: [DomainOverlapSegment]
+
+    var body: some View {
+        GroupBox(title) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Comparison uses unique referring domains in the currently imported datasets. A domain may be absent because a provider has not yet discovered it or its report is sampled.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Chart(segments.filter { !$0.domains.isEmpty }) { item in
+                    SectorMark(angle: .value("Domains", item.domains.count), innerRadius: .ratio(0.55))
+                        .foregroundStyle(by: .value("Set", item.label))
+                }
+                .chartLegend(position: .bottom, alignment: .leading)
+                .frame(height: 190)
+                Text("Domains by segment").font(.caption.weight(.semibold))
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 5) {
+                        ForEach(segments.filter { !$0.domains.isEmpty }) { item in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(item.label) · \(item.domains.count)").font(.caption.weight(.semibold))
+                                Text(item.domains.joined(separator: ", "))
+                                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                            Divider()
+                        }
+                    }
+                }
+                .frame(maxHeight: 170)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct BacklinkSourceProgressRow: View {
+    let title: String
+    let completed: Int
+    let total: Int
+    let message: String
+    let tint: Color
+    let isRunning: Bool
+    let stats: BacklinkSourceStats
+    /// Only sources with a real time-series (DataForSEO) pass history.
+    /// Ahrefs and Ubersuggest currently expose a donor list, not a monthly
+    /// referring-domain history, so they pass an empty array and render a
+    /// neutral note instead of a fabricated chart.
+    var history: [BacklinkHistoryPoint] = []
+    var isClassifying = false
+    var isDomainLevel = false
+    @State private var pulsing = false
+
+    private var safeTotal: Int { max(1, total) }
+    private var safeCompleted: Int { min(max(0, completed), safeTotal) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("\(safeCompleted) / \(safeTotal)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: Double(safeCompleted), total: Double(safeTotal))
+                .tint(tint)
+                // A slow meditative pulse while donor pages are classified, so
+                // the user can see the analysis is alive even without a
+                // changing counter.
+                .opacity(isClassifying && pulsing ? 0.45 : 1)
+                .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: pulsing)
+            Text(message.isEmpty ? (isRunning ? "Starting…" : "Ready") : message)
+                .font(.caption)
+                .foregroundStyle(isRunning ? .primary : .secondary)
+                .lineLimit(2)
+            Text("Links: \(stats.links) · donors: \(stats.donors) · profiles: \(stats.profiles) · catalogs: \(stats.catalogs) · articles: \(stats.articles) · hreflang: \(stats.hreflang) · spam: \(stats.spam) · other: \(stats.unclassified) · broken: \(stats.broken)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            if isDomainLevel, stats.donors > 0 {
+                Text("For GSC, Ahrefs and Ubersuggest, categories are donor-domain signals: these sources do not expose every exact linking page.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            sourceProfileChart
+        }
+        .onAppear { if isClassifying { pulsing = true } }
+        .onChange(of: isClassifying) { _, active in pulsing = active }
+    }
+
+    @ViewBuilder private var sourceProfileChart: some View {
+        if history.count >= 2 {
+            SourceProfileHistoryChart(points: history, color: tint)
+        } else if isRunning {
+            ProgressView().controlSize(.small)
+        } else if stats.donors > 0 {
+            // A provider is loaded but exposes no monthly referring-domain
+            // history (Ahrefs/Ubersuggest donor lists, unlike DataForSEO's
+            // live history, are not a time series). Say so plainly rather
+            // than drawing a fake chart.
+            Text("Ссылочный профиль: месячная история от этого источника не предоставляется")
+                .font(.caption).foregroundStyle(.tertiary)
+        }
+    }
+}
+
+/// Monthly referring-domain history for one backlink source. Rendered under the
+/// source's own progress bar so "how the link profile changed over time" is
+/// read next to the download that produced it.
+private struct SourceProfileHistoryChart: View {
+    let points: [BacklinkHistoryPoint]
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text("Ссылочный профиль (referring domains)").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Text("\(points.count) months").font(.caption2).foregroundStyle(.tertiary)
+            }
+            Chart(points) { point in
+                LineMark(x: .value("Month", monthLabel(point.date)), y: .value("Referring domains", point.referringDomains))
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(color)
+                    .lineStyle(StrokeStyle(lineWidth: 2))
+                AreaMark(x: .value("Month", monthLabel(point.date)), y: .value("Referring domains", point.referringDomains))
+                    .interpolationMethod(.catmullRom)
+                    .foregroundStyle(LinearGradient(colors: [color.opacity(0.28), color.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+            }
+            .chartYScale(domain: .automatic(includesZero: true))
+            .chartXAxis {
+                AxisMarks(values: .automatic(desiredCount: 6)) { _ in AxisValueLabel().font(.caption2) }
+            }
+            .chartYAxis {
+                AxisMarks { _ in AxisValueLabel().font(.caption2) }
+            }
+            .frame(height: 90)
+        }
+        .padding(.top, 4)
+    }
+
+    private func monthLabel(_ date: String) -> String {
+        guard date.count >= 7 else { return date }
+        let parts = date.prefix(7).split(separator: "-")
+        guard parts.count == 2, let year = parts.first, let month = parts.last else { return String(date.prefix(7)) }
+        return "\(year)-\(month)"
+    }
+}
+
+private struct BacklinkComparisonDashboard: View {
+    let dataForSEO: Set<String>
+    let dataForSEORanks: [String: Int]
+    let ahrefs: Set<String>
+    let ahrefsRatings: [String: Double]
+    let ubersuggest: Set<String>
+    let searchConsole: Set<String>
+    let loadDataForSEO: () -> Void
+    let loadAhrefs: () -> Void
+    let loadUbersuggest: () -> Void
+    let loadSearchConsole: () -> Void
+    let dataForSEORunning: Bool
+    let ahrefsRunning: Bool
+    let ubersuggestRunning: Bool
+    let searchConsoleRunning: Bool
+
+    var body: some View {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Referring-domain source comparison").font(.headline)
+                // Only render a comparison when both datasets are present. Datasets
+                // that are not yet loaded are deliberately omitted instead of shown
+                // as empty "load this source" placeholder panels.
+                if !dataForSEO.isEmpty && !ahrefs.isEmpty {
+                    DomainOverlapPanel(title: "DataForSEO × Ahrefs", segments: pair(left: dataForSEO, leftName: "DataForSEO only", right: ahrefs, rightName: "Ahrefs only", sharedName: "In both sources"))
+                }
+                if !ubersuggest.isEmpty && !ahrefs.isEmpty {
+                    DomainOverlapPanel(title: "Ubersuggest × Ahrefs", segments: pair(left: ubersuggest, leftName: "Ubersuggest only", right: ahrefs, rightName: "Ahrefs only", sharedName: "In both sources"))
+                }
+                if !ubersuggest.isEmpty && !dataForSEO.isEmpty {
+                    DomainOverlapPanel(title: "Ubersuggest × DataForSEO", segments: pair(left: ubersuggest, leftName: "Ubersuggest only", right: dataForSEO, rightName: "DataForSEO only", sharedName: "In both sources"))
+                }
+                if !dataForSEO.isEmpty && !ubersuggest.isEmpty && !searchConsole.isEmpty {
+                    DomainOverlapPanel(title: "DataForSEO × Ubersuggest × Search Console", segments: triple())
+                }
+                if !dataForSEO.isEmpty || !ahrefs.isEmpty || !ubersuggest.isEmpty || !searchConsole.isEmpty {
+                    ReferringDomainSourceTable(dataForSEO: dataForSEO, dataForSEORanks: dataForSEORanks, ahrefs: ahrefs, ahrefsRatings: ahrefsRatings, ubersuggest: ubersuggest, searchConsole: searchConsole)
+                }
+            }
+        }
+
+        private func pair(left: Set<String>, leftName: String, right: Set<String>, rightName: String, sharedName: String) -> [DomainOverlapSegment] {
+        [
+            .init(label: sharedName, domains: left.intersection(right).sorted()),
+            .init(label: leftName, domains: left.subtracting(right).sorted()),
+            .init(label: rightName, domains: right.subtracting(left).sorted())
+        ]
+    }
+    private func triple() -> [DomainOverlapSegment] {
+        let all = dataForSEO.intersection(ubersuggest).intersection(searchConsole)
+        let dataUber = dataForSEO.intersection(ubersuggest).subtracting(searchConsole)
+        let dataGSC = dataForSEO.intersection(searchConsole).subtracting(ubersuggest)
+        let uberGSC = ubersuggest.intersection(searchConsole).subtracting(dataForSEO)
+        return [
+            .init(label: "All three sources", domains: all.sorted()),
+            .init(label: "DataForSEO + Ubersuggest", domains: dataUber.sorted()),
+            .init(label: "DataForSEO + Search Console", domains: dataGSC.sorted()),
+            .init(label: "Ubersuggest + Search Console", domains: uberGSC.sorted()),
+            .init(label: "DataForSEO only", domains: dataForSEO.subtracting(ubersuggest).subtracting(searchConsole).sorted()),
+            .init(label: "Ubersuggest only", domains: ubersuggest.subtracting(dataForSEO).subtracting(searchConsole).sorted()),
+            .init(label: "Search Console only", domains: searchConsole.subtracting(dataForSEO).subtracting(ubersuggest).sorted())
+        ]
+    }
+}
+
+private struct ReferringDomainSourceRow: Identifiable {
+    let domain: String
+    let ahrefsDR: Double?
+    let dataForSEORank: Int?
+    let inAhrefs: Bool
+    let inDataForSEO: Bool
+    let inUbersuggest: Bool
+    let inSearchConsole: Bool
+    var id: String { domain }
+}
+
+/// One auditable row per unique donor. The provider marks show discovery, not
+/// a claim that the link is currently live in every index.
+private struct ReferringDomainSourceTable: View {
+    let dataForSEO: Set<String>
+    let dataForSEORanks: [String: Int]
+    let ahrefs: Set<String>
+    let ahrefsRatings: [String: Double]
+    let ubersuggest: Set<String>
+    let searchConsole: Set<String>
+
+    private var rows: [ReferringDomainSourceRow] {
+        let all = dataForSEO.union(ahrefs).union(ubersuggest).union(searchConsole)
+        return all.map { domain in
+            ReferringDomainSourceRow(
+                domain: domain,
+                ahrefsDR: ahrefsRatings[domain],
+                dataForSEORank: dataForSEORanks[domain],
+                inAhrefs: ahrefs.contains(domain),
+                inDataForSEO: dataForSEO.contains(domain),
+                inUbersuggest: ubersuggest.contains(domain),
+                inSearchConsole: searchConsole.contains(domain)
+            )
+        }
+        .sorted {
+            let lhs = $0.ahrefsDR ?? -1
+            let rhs = $1.ahrefsDR ?? -1
+            return lhs == rhs ? $0.domain < $1.domain : lhs > rhs
+        }
+    }
+
+    var body: some View {
+        GroupBox("Referring-domain comparison") {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("\(rows.count) unique domains · sorted by Ahrefs DR (highest first). A checkmark means the provider reported this donor in its imported dataset.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Table(rows) {
+                    TableColumn("Domain") { Text($0.domain).textSelection(.enabled) }.width(min: 240, ideal: 330)
+                    TableColumn("Ahrefs DR") { row in Text(row.ahrefsDR.map { String(format: "%.1f", $0) } ?? "—").monospacedDigit() }.width(85)
+                    TableColumn("DataForSEO DR") { row in
+                        Text(row.dataForSEORank.map(String.init) ?? "—").monospacedDigit()
+                    }.width(105)
+                    TableColumn("Ahrefs") { sourceMark($0.inAhrefs) }.width(68)
+                    TableColumn("DataForSEO") { sourceMark($0.inDataForSEO) }.width(100)
+                    TableColumn("Ubersuggest") { sourceMark($0.inUbersuggest) }.width(100)
+                    TableColumn("Search Console") { sourceMark($0.inSearchConsole) }.width(115)
+                }
+                .frame(height: 280)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func sourceMark(_ present: Bool) -> some View {
+        if present { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).accessibilityLabel("Found") }
+        else { Text("—").foregroundStyle(.secondary) }
+    }
 }
 
 private struct BacklinkSourceRow: View {
@@ -1067,26 +1609,13 @@ struct AuditView: View {
                     Button("Reset results", role: .destructive) { model.resetAuditAndCrawl() }
                         .disabled(model.auditRunning || model.aiAuditRunning || model.visualAuditRunning || model.pageSpeedRunning)
                     if let report = model.auditReport {
-                        Button("Export client PDF") {
-                            _ = ClientPDFReport.export(report: report, records: model.records, issues: model.issues, approvedVisualIDs: model.approvedVisualIssueIDs, startURL: model.startText)
+                        Button("Export audit PDF") {
+                            if let url = ClientPDFReport.export(report: report, records: model.records, issues: model.issues, approvedVisualIDs: model.approvedVisualIssueIDs, startURL: model.startText) {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
                         }.disabled(model.auditRunning)
-                        HStack(spacing: 0) {
-                            Button("Export technical tasks") {
-                                model.exportTechnicalTasks(severity: .highMedium)
-                            }
-                            Menu {
-                                ForEach(TechnicalTaskPDFReport.Severity.allCases) { severity in
-                                    Button("\(severity.rawValue) priority") {
-                                        model.exportTechnicalTasks(severity: severity)
-                                    }
-                                }
-                            } label: {
-                                Image(systemName: "chevron.down")
-                            }
-                            .menuStyle(.borderlessButton)
-                            .frame(width: 27)
-                        }
-                        .help("Save a developer / SEO specialist task brief. The main button exports High + Medium tasks; the arrow selects another priority.")
+                        Button("Export developer report") { model.exportTechnicalTasks() }
+                        .help("Saves one developer report with High and Medium priority findings.")
                         .disabled(model.auditRunning || model.records.isEmpty)
                     }
                     if model.aiAuditReport != nil {
@@ -1097,12 +1626,17 @@ struct AuditView: View {
                 if let report = model.auditReport {
                     GroupBox("Domain profile") {
                         VStack(alignment: .leading, spacing: 6) {
-                            HStack { Text("Ahrefs Domain Rating").fontWeight(.semibold); Spacer(); if let dr = report.siteProfile.domainRating { Text(String(format: "%.1f / 100", dr)).font(.title3.weight(.bold)) } else { Text("Unavailable").foregroundStyle(.orange) } }
-                            if !report.siteProfile.domainRatingError.isEmpty { Text(report.siteProfile.domainRatingError).font(.caption).foregroundStyle(.secondary) }
-                            Text("Source: Domain Rating by Ahrefs").font(.caption2).foregroundStyle(.secondary)
-                            Divider()
                             Text("Primary server IP: \(report.siteProfile.ipAddresses.first ?? "could not be resolved")")
                             Divider()
+                            if let rating = report.siteProfile.domainRating {
+                                HStack { Text("Ahrefs Domain Rating").fontWeight(.semibold); Spacer(); Text(String(format: "%.1f", rating)) }
+                                Divider()
+                            } else if AhrefsKeychain.isConfigured && !report.siteProfile.domainRatingError.isEmpty {
+                                Text("Ahrefs: \(report.siteProfile.domainRatingError)")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                Divider()
+                            }
                             HStack { Text("CMS").fontWeight(.semibold); Spacer(); Text(report.siteProfile.cmsName) }
                             if report.siteProfile.cmsName == "Unknown" { Text("No CMS signature matched. Add or adjust signatures in cms-detection-rules.json.").font(.caption).foregroundStyle(.secondary) }
                             else { Text("Confidence \(Int(report.siteProfile.cmsConfidence * 100))% · \(report.siteProfile.cmsEvidence.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) }
@@ -1308,7 +1842,7 @@ struct AuditView: View {
                 stageRow("Link Profile Analysis", stage: .linkAnalysis)
                 stageRow("Technical SEO Analysis", stage: .technicalAnalysis)
                 stageRow("GSC Analysis", stage: .gscAnalysis)
-                stageRow("Codex Deep Analysis", stage: .codexAnalysis)
+                stageRow("Agent Deep Analysis", stage: .agentAnalysis)
                 stageRow("Verification", stage: .verification)
                 stageRow("Executive Summary", stage: .executiveSummary)
             }.padding()
@@ -1316,13 +1850,29 @@ struct AuditView: View {
         if let report = model.aiAuditReport {
             GroupBox("Executive summary") { Text(report.executiveSummary).fontWeight(.bold).frame(maxWidth: .infinity, alignment: .leading) }
             HStack(spacing: 10) {
-                AIAuditSummaryCard(title: "Crawl", detail: "\(report.crawlSummary.totalURLs) URLs · \(report.crawlSummary.errorCount) errors\n\(report.crawlSummary.missingTitles) missing titles")
-                AIAuditSummaryCard(title: "Backlinks", detail: "DR \(report.backlinkSummary.domainRank) · \(report.backlinkSummary.totalBacklinks) links\n\(report.backlinkSummary.referringDomains) referring domains")
+                AIAuditSummaryCard(title: "Crawl", detail: "\(report.crawlSummary.totalURLs) URLs · \(report.crawlSummary.errorCount) errors\n\(report.crawlSummary.successfulTitledPages) HTML 200 pages with title\nSitemap: \(report.crawlSummary.sitemapAvailable ? "\(report.crawlSummary.sitemapURLs) URLs" : "not found")")
+                AIAuditSummaryCard(title: "Backlinks", detail: "\(report.backlinkSummary.totalBacklinks) active links\n\(report.backlinkSummary.referringDomains) referring domains")
                 AIAuditSummaryCard(title: "Search Console", detail: report.searchConsoleSummary.available ? "\(report.searchConsoleSummary.indexedPages) indexed · \(report.searchConsoleSummary.notIndexedPages) not indexed\n\(report.searchConsoleSummary.clicks7d) clicks · \(report.searchConsoleSummary.impressions7d) impressions" : "Unavailable\n\(report.searchConsoleSummary.unavailableReason)")
             }
             GroupBox("Анализ ссылочного профиля") { Text(report.backlinkAnalysis).frame(maxWidth: .infinity, alignment: .leading) }
             GroupBox("Технические ошибки") { Text(report.technicalAnalysis).frame(maxWidth: .infinity, alignment: .leading) }
             GroupBox("Ошибки Search Console") { Text(report.searchConsoleAnalysis).frame(maxWidth: .infinity, alignment: .leading) }
+            GroupBox("Page Weight · ShareSpider recommendations") {
+                let metrics = report.technicalIssuesDetail.pageMetrics
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Median page weight: \(ByteCountFormatter.string(fromByteCount: Int64(metrics.medianWeight), countStyle: .file)) · Heavy: \(metrics.heavyPages) · Abnormally heavy: \(metrics.abnormalPages)")
+                    if !metrics.typeMedians.isEmpty { Text(metrics.typeMedians.map { "\($0.type): \(ByteCountFormatter.string(fromByteCount: Int64($0.count), countStyle: .file))" }.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
+                    ForEach(metrics.examples, id: \.self) { Text($0).font(.caption).lineLimit(1) }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("AI Parsability · ShareSpider assessment") {
+                let metrics = report.technicalIssuesDetail.pageMetrics
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("AI friendly: \(metrics.aiFriendly) · Heavy: \(metrics.aiHeavy) · Very heavy: \(metrics.aiVeryHeavy)")
+                    Text("Median HTML: \(ByteCountFormatter.string(fromByteCount: Int64(metrics.medianHTML), countStyle: .file)) · median HTML context: \(metrics.medianTokens) tokens · median DOM: \(metrics.medianDOM) nodes").font(.caption).foregroundStyle(.secondary)
+                    Text("Potential parsing obstacles — large DOM: \(metrics.largeDOM), low content/HTML: \(metrics.lowContentRatio), large inline data: \(metrics.largeInlineData). This is a ShareSpider assessment, not an official limit for every AI system.").font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
             if !report.findings.isEmpty { Text("Findings").font(.title3.weight(.semibold)) }
             ForEach(report.findings) { finding in
                 GroupBox {
@@ -1334,7 +1884,7 @@ struct AuditView: View {
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            Text("Codex Deep Analysis · \(report.customAnalyses.count) custom analyses").font(.title3.weight(.semibold))
+            Text("\(AIProviderSettings.load().agent.title) Deep Analysis · \(report.customAnalyses.count) custom analyses").font(.title3.weight(.semibold))
             if report.customAnalyses.isEmpty {
                 Text("No custom analyses were generated. The audit data did not reveal anomalies requiring deeper investigation.").foregroundStyle(.secondary)
             }
@@ -1346,6 +1896,19 @@ struct AuditView: View {
                         Text(analysis.finalConclusion).frame(maxWidth: .infinity, alignment: .leading)
                         Text("Confidence: \(analysis.confidence) · Model: \(analysis.modelUsed)").font(.caption).foregroundStyle(.secondary)
                     }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if !report.probableFindings.isEmpty {
+                Text("Probable findings — require review").font(.headline)
+                ForEach(report.probableFindings) { analysis in
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Probable · \(analysis.confidence) confidence").font(.caption.weight(.bold)).foregroundStyle(.orange)
+                            Text(analysis.question).font(.headline)
+                            Text(analysis.finalConclusion).frame(maxWidth: .infinity, alignment: .leading)
+                            Text("Evidence: \(analysis.codexVerification)").font(.caption).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
             if !report.rejectedFindings.isEmpty {
@@ -1374,10 +1937,10 @@ struct AuditView: View {
         }
     }
     private func stageOrderIndex(_ stage: AIAuditStage) -> Int {
-        switch stage { case .notStarted, .collectingData: 0; case .linkAnalysis: 1; case .technicalAnalysis: 2; case .gscAnalysis: 3; case .codexAnalysis: 4; case .verification: 5; case .executiveSummary: 6; case .complete: 7 }
+        switch stage { case .notStarted, .collectingData: 0; case .linkAnalysis: 1; case .technicalAnalysis: 2; case .gscAnalysis: 3; case .agentAnalysis: 4; case .verification: 5; case .executiveSummary: 6; case .complete: 7 }
     }
     private func stageLabel(_ stage: AIAuditStage) -> String {
-        switch stage { case .collectingData: "Collecting audit data…"; case .linkAnalysis: "Analyzing link profile…"; case .technicalAnalysis: "Analyzing technical SEO…"; case .gscAnalysis: "Analyzing Search Console…"; case .codexAnalysis: "Running Codex deep analysis…"; case .verification: "Verifying findings…"; case .executiveSummary: "Writing executive summary…"; case .complete: "AI audit complete"; default: "Preparing AI audit…" }
+        switch stage { case .collectingData: "Collecting audit data…"; case .linkAnalysis: "Analyzing link profile…"; case .technicalAnalysis: "Analyzing technical SEO…"; case .gscAnalysis: "Analyzing Search Console…"; case .agentAnalysis: "Running \(AIProviderSettings.load().agent.title) deep analysis…"; case .verification: "Verifying findings…"; case .executiveSummary: "Writing executive summary…"; case .complete: "AI audit complete"; default: "Preparing AI audit…" }
     }
     @ViewBuilder
     private func gscExamples(_ title: String, _ records: [CrawlRecord], detail: @escaping (CrawlRecord) -> String) -> some View {
@@ -1638,6 +2201,7 @@ struct AuditIssueCard: View {
     let issue: Issue
     let records: [CrawlRecord]
     private var examples: [CrawlRecord] { Array(records.filter { issue.urlIDs.contains($0.id) }.prefix(10)) }
+    private var externalExamples: [String] { Array(issue.externalURLs.prefix(10)) }
     private var isTitleProblem: Bool { issue.name.localizedCaseInsensitiveContains("title") }
     private var isImageAltProblem: Bool { issue.name == "Images without alt text" }
     private var isEmbeddedImageProblem: Bool { isImageAltProblem || issue.name == "Images over 100 KB" }
@@ -1647,6 +2211,10 @@ struct AuditIssueCard: View {
         issue.name.localizedCaseInsensitiveContains("title") || issue.name.localizedCaseInsensitiveContains("meta description")
     }
     private var isSchemaProblem: Bool { issue.name.localizedCaseInsensitiveContains("schema") || issue.name.localizedCaseInsensitiveContains("structured data") }
+    private var isPageWeightIssue: Bool { issue.name.localizedCaseInsensitiveContains("page weight") }
+    private var isAIParsabilityIssue: Bool { issue.name.localizedCaseInsensitiveContains("ai:") }
+    private var isMetricsIssue: Bool { isPageWeightIssue || isAIParsabilityIssue }
+    private var pageWeightMedians: [String: Int] { PageMetricsAnalyzer.typeMedians(records) }
     private var description: String {
         switch issue.name {
         case "Internal server/client errors": return "These pages return an error or could not be loaded. Search engines and visitors may be unable to access their content."
@@ -1668,6 +2236,10 @@ struct AuditIssueCard: View {
         case "Pages without JSON-LD structured data": return "These pages do not contain JSON-LD schema markup. Add relevant schema.org markup to help search engines understand page entities and content."
         case "Missing Organization / Business schema": return "No Organization or LocalBusiness structured data was found on the crawled site. Add it, normally on the home page or site-wide template, with name, URL, logo and contact details."
         case "Missing BreadcrumbList schema": return "No BreadcrumbList structured data was found. Add breadcrumb schema to eligible navigational pages so search engines can understand page hierarchy."
+        case "Page Weight: Heavy Pages": return "These HTML pages exceed the ShareSpider page-weight recommendation. The resource breakdown below identifies what contributes most."
+        case "Page Weight: Abnormally Heavy Pages": return "These pages are materially heavier than the median for their Page Type. Compare the breakdown with the template median before optimising."
+        case "AI: Heavy for AI Parsing": return "These pages exceed ShareSpider Easy Parsing recommendations for HTML size, token estimate, DOM size, inline data or content ratio."
+        case "AI: Very Heavy for AI Parsing": return "These pages exceed the critical ShareSpider Easy Parsing recommendation and may be inefficient for external AI/LLM parsers."
         default: return "This issue requires review. Inspect the affected URLs and apply a consistent technical SEO fix."
         }
     }
@@ -1675,27 +2247,32 @@ struct AuditIssueCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack { Text(issue.name).font(.headline); Spacer(); Text(issue.priority.uppercased()).font(.caption.weight(.bold)).foregroundStyle(issue.priority == "High" ? .red : issue.priority == "Medium" ? .orange : .secondary); Text("\(issue.count) URLs").font(.caption).foregroundStyle(.secondary) }
             Text(description).foregroundStyle(.secondary)
-            if !examples.isEmpty {
+            if !examples.isEmpty || !externalExamples.isEmpty {
                 Divider()
                 Text("Examples (up to 10)").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                if isEmbeddedImageProblem {
+                if !externalExamples.isEmpty {
+                    ForEach(externalExamples, id: \.self) { value in
+                        HStack { Text("•").foregroundStyle(.secondary); Text(value).font(.caption).textSelection(.enabled); if let url = URL(string: value) { URLActions(url: url) } }
+                    }
+                } else if isEmbeddedImageProblem {
                     ForEach(Array(examples.flatMap { page in page.images.filter { isImageAltProblem ? $0.alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty : $0.size > 100_000 }.map { "\(page.url.absoluteString)\nImage: \($0.url)\(isImageAltProblem ? "" : " (\(ByteCountFormatter.string(fromByteCount: Int64($0.size), countStyle: .file)))")" } }.prefix(10)), id: \.self) { example in
                         Text("• \(example)").font(.caption).textSelection(.enabled)
                     }
                 } else {
                     ForEach(examples) { record in
                         VStack(alignment: .leading, spacing: 2) {
-                            HStack(alignment: .firstTextBaseline) { Text("•").foregroundStyle(.secondary); Text(record.url.absoluteString).font(.caption).textSelection(.enabled); URLActions(url: record.url); Spacer(minLength: 8); Text(record.statusText).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                            HStack(alignment: .firstTextBaseline) { Text("•").foregroundStyle(.secondary); Text(record.url.absoluteString).font(.caption).textSelection(.enabled); URLActions(url: record.url); Spacer(minLength: 8); Text(record.transportLabel).font(.caption).foregroundStyle(record.transportUsed == "cdp" ? .blue : .secondary); Text(record.statusText).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                             if isSchemaProblem { Text(record.schemaTypes.isEmpty ? "JSON-LD schema not found" : "JSON-LD: \(record.schemaTypes.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary).padding(.leading, 14).textSelection(.enabled) }
                             else if issue.name == "WordPress technical head links" { Text(record.wordPressHeadFindings.joined(separator: " · ")).font(.caption).foregroundStyle(.orange).padding(.leading, 14).textSelection(.enabled) }
                             else if isRedirectProblem, let source = record.redirectSources.first { Text("Redirect: \(source.absoluteString) → \(record.url.absoluteString)").font(.caption).foregroundStyle(.orange).padding(.leading, 14).textSelection(.enabled) }
                             else if isTitleProblem { Text("Title (\(record.title.count)): \(record.title.isEmpty ? "missing" : record.title)").font(.caption).foregroundStyle(.secondary).padding(.leading, 14).textSelection(.enabled) }
                             else if isImageResourceProblem { Text("\(record.contentType) · \(record.size > 0 ? ByteCountFormatter.string(fromByteCount: Int64(record.size), countStyle: .file) : "size unavailable")").font(.caption).foregroundStyle(record.statusCode.map { $0 >= 400 } == true ? .red : .secondary).padding(.leading, 14) }
+                            else if isMetricsIssue { PageMetricsAuditDetail(record: record, median: pageWeightMedians[record.pageType], showAI: isAIParsabilityIssue).padding(.leading, 14) }
                             // A title/description problem belongs to the page
                             // itself; referrer URLs are noise in these audit
                             // cards. Keep link sources for link/directive and
                             // response-code problems, where they are actionable.
-                            if !isMetadataProblem && !record.foundOnURLs.isEmpty { FoundOnLinks(urls: record.foundOnURLs).padding(.leading, 14) }
+                            if !isMetadataProblem && !isMetricsIssue && !record.foundOnURLs.isEmpty { FoundOnLinks(urls: record.foundOnURLs).padding(.leading, 14) }
                         }
                     }
                 }
@@ -1705,6 +2282,40 @@ struct AuditIssueCard: View {
         .background(Color.white)
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary, lineWidth: 1))
+    }
+}
+
+private struct PageMetricsAuditDetail: View {
+    let record: CrawlRecord
+    let median: Int?
+    let showAI: Bool
+    @State private var expanded = false
+    private func size(_ value: Int) -> String { ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file) }
+    private var multiplier: String {
+        guard let median, median > 0 else { return "" }
+        return String(format: " · %.1f× median", Double(record.pageWeight) / Double(median))
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if showAI {
+                Text("HTML \(size(record.htmlSize)) · recommended ≤ 600 KB · \(record.estimatedHTMLTokens / 1_000)K tokens, DOM \(record.domNodeCount), inline JS \(size(record.inlineJavaScriptSize)), embedded JSON \(size(record.embeddedJSONSize)), content ratio \(Int(record.contentToHTMLRatio * 100))%")
+                    .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            } else {
+                Text("\(size(record.pageWeight)) · median \(median.map(size) ?? "—")\(multiplier) · primary cause: \(record.primaryWeightCause)")
+                    .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                Text("Images \(size(record.imageResourceSize)), JS \(size(record.javascriptResourceSize)), HTML \(size(record.htmlSize)), CSS \(size(record.cssResourceSize)), Fonts \(size(record.fontResourceSize))")
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            Button(expanded ? "Read less" : "Read more") { expanded.toggle() }.buttonStyle(.link).font(.caption)
+            if expanded {
+                Text("Requests \(record.resourceRequestCount) · third-party \(size(record.thirdPartyResourceSize)) · inline CSS \(size(record.inlineCSSSize)) · JSON-LD \(size(record.embeddedJSONSize)) · extracted text \(size(record.extractedTextSize))")
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                ForEach(Array(record.pageResources.prefix(10)), id: \.url) { resource in
+                    Text("\(resource.kind) · \(size(resource.size))\(resource.thirdParty ? " · third-party" : "") · \(resource.url)")
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
+                }
+            }
+        }
     }
 }
 
@@ -1763,10 +2374,45 @@ private struct AuditIssueSegmentation: View {
 struct URLsView: View {
     @ObservedObject var model: CrawlViewModel
     @State private var query = ""; @State private var selection = Set<UUID>(); @State private var filter = "All"
-    private var visible: [CrawlRecord] { model.records.filter { record in (model.overviewSelectionName == nil || model.overviewSelectionIDs.contains(record.id)) && (filter == "All" || (filter == "Errors" && (!record.error.isEmpty || (record.statusCode ?? 0) >= 400)) || (filter == "HTML" && record.isHTML)) && (query.isEmpty || record.url.absoluteString.localizedCaseInsensitiveContains(query) || record.title.localizedCaseInsensitiveContains(query)) } }
+    private var visible: [CrawlRecord] { model.records.filter { record in
+        !record.isImageCandidate && !record.isPDFResource &&
+        (model.overviewSelectionName == nil || model.overviewSelectionIDs.contains(record.id)) &&
+        (filter == "All" || (filter == "Errors" && (!record.error.isEmpty || (record.statusCode ?? 0) >= 400)) || (filter == "HTML" && record.isHTML)) &&
+        (query.isEmpty || record.url.absoluteString.localizedCaseInsensitiveContains(query) || record.title.localizedCaseInsensitiveContains(query))
+    } }
+    private var selectedVisible: [CrawlRecord] { visible.filter { selection.contains($0.id) } }
+    private var visibleCSVRows: [[String]] {
+        visible.map { record in
+            [
+                record.url.absoluteString, record.statusText, record.transportLabel,
+                record.contentType, record.indexability, record.title,
+                record.displayPageType,
+                record.pageWeight > 0 ? ByteCountFormatter.string(fromByteCount: Int64(record.pageWeight), countStyle: .file) : "",
+                record.transferredSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64(record.transferredSize), countStyle: .file) : "",
+                record.htmlSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64(record.htmlSize), countStyle: .file) : ""
+            ]
+        }
+    }
     var body: some View {
         VStack(spacing: 8) {
-        HStack { VStack(alignment: .leading) { Text("URLs").font(.title2.weight(.semibold)); if let metric = model.overviewSelectionName { Text("Overview filter: \(metric) (\(model.overviewSelectionIDs.count))").font(.caption).foregroundStyle(.secondary) } }; Spacer(); if model.overviewSelectionName != nil { Button("Clear overview filter") { model.clearOverviewSelection() }.controlSize(.small) }; Button(model.searchConsoleRunning ? "Checking Search Console…" : "Fetch Search Console") { model.inspectSearchConsole(urlIDs: Set(visible.map(\.id))) }.disabled(model.searchConsoleRunning || visible.isEmpty).help("Checks only URLs currently shown in the table"); Button(model.gscChromePageIndexingSyncRunning ? "Syncing Page Indexing…" : "Sync GSC Page Indexing") { model.syncGSCPageIndexingThroughChrome() }.disabled(model.gscChromePageIndexingSyncRunning).help("Uses Chrome for the Page Indexing report."); Button(model.gscChromeCoreWebVitalsSyncRunning ? "Syncing Core Web Vitals…" : "Sync GSC Core Web Vitals") { model.syncGSCCoreWebVitalsThroughChrome() }.disabled(model.gscChromeCoreWebVitalsSyncRunning).help("Imports mobile Poor / Needs improvement groups from Chrome."); Button(model.backlinkRunning ? "Loading Backlinks…" : "Refresh Backlink Data") { model.refreshBacklinkData() }.disabled(model.backlinkRunning || model.records.isEmpty).help("Loads the DataForSEO domain summary and page metrics; results are cached for 7 days."); Picker("Filter", selection: $filter) { Text("All").tag("All"); Text("Errors").tag("Errors"); Text("HTML").tag("HTML") }.frame(width: 130); TextField("Search URLs or titles", text: $query).textFieldStyle(.roundedBorder).frame(width: 250) }
+        HStack {
+            VStack(alignment: .leading) {
+                Text("URLs").font(.title2.weight(.semibold))
+                if let metric = model.overviewSelectionName { Text("Overview filter: \(metric) (\(model.overviewSelectionIDs.count))").font(.caption).foregroundStyle(.secondary) }
+            }
+            Spacer()
+            if model.overviewSelectionName != nil { Button("Clear overview filter") { model.clearOverviewSelection() }.controlSize(.small) }
+            Button("Select all") { selection = Set(visible.map(\.id)) }.disabled(visible.isEmpty)
+            Button("Copy selected") { URLListTransfer.copy(selectedVisible.map { $0.url.absoluteString }) }.disabled(selectedVisible.isEmpty)
+            Button("Copy all") { URLListTransfer.copy(visible.map { $0.url.absoluteString }) }.disabled(visible.isEmpty)
+            Button("Export all") { URLListTransfer.export(name: "SEOSpiderAgent-URLs.csv", header: ["URL", "Status", "Source", "Content type", "Indexability", "Title", "Page type", "Page weight", "Transferred", "Decoded HTML"], rows: visibleCSVRows) }.disabled(visible.isEmpty)
+            Button(model.searchConsoleRunning ? "Checking Search Console…" : "Fetch Search Console") { model.inspectSearchConsole(urlIDs: Set(visible.map(\.id))) }.disabled(model.searchConsoleRunning || visible.isEmpty).help("Checks only URLs currently shown in the table")
+            Button(model.gscChromePageIndexingSyncRunning ? "Syncing Page Indexing…" : "Sync GSC Page Indexing") { model.syncGSCPageIndexingThroughChrome() }.disabled(model.gscChromePageIndexingSyncRunning).help("Uses Chrome for the Page Indexing report.")
+            Button(model.gscChromeCoreWebVitalsSyncRunning ? "Syncing Core Web Vitals…" : "Sync GSC Core Web Vitals") { model.syncGSCCoreWebVitalsThroughChrome() }.disabled(model.gscChromeCoreWebVitalsSyncRunning).help("Imports mobile Poor / Needs improvement groups from Chrome.")
+            Button(model.backlinkRunning ? "Loading Backlinks…" : "Refresh Backlink Data") { model.refreshBacklinkData() }.disabled(model.backlinkRunning || model.records.isEmpty).help("Loads the DataForSEO domain summary and page metrics; results are cached for 7 days.")
+            Picker("Filter", selection: $filter) { Text("All").tag("All"); Text("Errors").tag("Errors"); Text("HTML").tag("HTML") }.frame(width: 130)
+            TextField("Search URLs or titles", text: $query).textFieldStyle(.roundedBorder).frame(width: 250)
+        }
             if !model.searchConsoleMessage.isEmpty {
                 HStack(spacing: 8) { if model.searchConsoleRunning { ProgressView().controlSize(.small) }; Text(model.searchConsoleMessage).font(.caption).foregroundStyle(.secondary); Spacer() }.frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1809,11 +2455,14 @@ struct URLsView: View {
         }
     }
     private var urlsTable: some View {
-        Table(visible, selection: $selection) { basicColumns; inspectionColumns; performanceColumns; backlinkColumns; backlinkNetworkColumns }
+        Table(visible, selection: $selection) { basicColumns; pageMetricsColumns; inspectionColumns; performanceColumns; backlinkColumns; backlinkNetworkColumns }
     }
     @TableColumnBuilder<CrawlRecord, Never> private var basicColumns: some TableColumnContent<CrawlRecord, Never> {
         TableColumn("URL") { record in HStack { Text(record.url.absoluteString).lineLimit(1); Spacer(); URLActions(url: record.url) } }.width(min: 250, ideal: 370)
         TableColumn("Status") { Text($0.statusText).foregroundStyle(($0.statusCode ?? 200) >= 400 ? .red : .primary) }.width(65)
+        TableColumn("Source") { record in
+            Text(record.transportLabel).foregroundStyle(record.transportUsed == "cdp" ? .blue : .secondary)
+        }.width(105)
         TableColumn("Content Type") { Text($0.contentType).lineLimit(1) }.width(115)
         TableColumn("Indexability") { Text($0.indexability) }.width(90)
         TableColumn("Title") { Text($0.title).lineLimit(1) }.width(min: 150, ideal: 260)
@@ -1830,6 +2479,18 @@ struct URLsView: View {
         TableColumn("GSC sitemap") { Text($0.searchConsoleSitemaps.isEmpty ? "—" : $0.searchConsoleSitemaps.joined(separator: ", ")).lineLimit(1) }.width(min: 150, ideal: 240)
         TableColumn("GSC Rich Results errors") { Text($0.searchConsoleRichResultErrors.isEmpty ? "—" : $0.searchConsoleRichResultErrors.joined(separator: "; ")).lineLimit(1) }.width(min: 160, ideal: 250)
         TableColumn("GSC mobile issues") { Text($0.searchConsoleMobileIssues.isEmpty ? "—" : $0.searchConsoleMobileIssues.joined(separator: "; ")).lineLimit(1) }.width(min: 160, ideal: 250)
+    }
+    @TableColumnBuilder<CrawlRecord, Never> private var pageMetricsColumns: some TableColumnContent<CrawlRecord, Never> {
+        TableColumn("Page Weight") { Text($0.pageWeight > 0 ? ByteCountFormatter.string(fromByteCount: Int64($0.pageWeight), countStyle: .file) : "—") }.width(105)
+        TableColumn("Transferred") { Text($0.transferredSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64($0.transferredSize), countStyle: .file) : "—") }.width(95)
+        TableColumn("Decoded HTML") { Text($0.htmlSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64($0.htmlSize), countStyle: .file) : "—") }.width(105)
+        TableColumn("Images") { Text($0.imageResourceSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64($0.imageResourceSize), countStyle: .file) : "—") }.width(95)
+        TableColumn("JS") { Text($0.javascriptResourceSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64($0.javascriptResourceSize), countStyle: .file) : "—") }.width(85)
+        TableColumn("CSS") { Text($0.cssResourceSize > 0 ? ByteCountFormatter.string(fromByteCount: Int64($0.cssResourceSize), countStyle: .file) : "—") }.width(85)
+        TableColumn("Requests") { Text($0.resourceRequestCount > 0 ? "\($0.resourceRequestCount)" : "—") }.width(75)
+        TableColumn("AI Parsability") { Text($0.aiParsability).lineLimit(1) }.width(155)
+        TableColumn("HTML Tokens") { Text($0.estimatedHTMLTokens > 0 ? "\($0.estimatedHTMLTokens)" : "—") }.width(105)
+        TableColumn("DOM Nodes") { Text($0.domNodeCount > 0 ? "\($0.domNodeCount)" : "—") }.width(90)
     }
     @TableColumnBuilder<CrawlRecord, Never> private var performanceColumns: some TableColumnContent<CrawlRecord, Never> {
         TableColumn("GSC clicks · 7d") { Text($0.searchConsolePerformanceChecked ? "\($0.searchConsoleClicks7d)" : "—") }.width(90)
@@ -1860,11 +2521,180 @@ struct SettingsView: View {
     @Binding var localVision: LocalVisionSettings
     @Environment(\.dismiss) private var dismiss
     @State private var pageSpeedKey = PSIKeychain.load()
+    @State private var openRouterKey = OpenRouterKeychain.load()
     @State private var ahrefsKey = AhrefsKeychain.load()
+    @State private var aiProviderSettings = AIProviderSettings.load()
     @State private var dataForSEOLogin = DataForSEOCredentials.load().login
     @State private var dataForSEOPassword = DataForSEOCredentials.load().password
     @StateObject private var searchConsole = SearchConsoleAuth.shared
+    @StateObject private var ubersuggest = UbersuggestMCPAuth.shared
     @State private var searchConsoleClientID = SearchConsoleAuth.shared.clientID
     @State private var searchConsoleClientSecret = SearchConsoleAuth.shared.clientSecret
-    var body: some View { VStack(alignment: .leading) { Text("Crawl Settings").font(.title2.weight(.semibold)); Form { TextField("User-Agent", text: $settings.userAgent); Stepper("Concurrent requests: \(settings.concurrency)", value: $settings.concurrency, in: 1...32); Stepper("Timeout: \(Int(settings.timeout)) seconds", value: $settings.timeout, in: 5...120, step: 5); Stepper("Maximum depth: \(settings.maxDepth)", value: $settings.maxDepth, in: 0...30); Stepper("Maximum URLs: \(settings.maxURLs)", value: $settings.maxURLs, in: 10...100_000, step: 100); Stepper("Visual audit pages: \(settings.visualAuditPageLimit)", value: $settings.visualAuditPageLimit, in: 1...8); Picker("robots.txt crawl mode", selection: $settings.respectRobots) { Text("Crawl pages even when blocked (default)").tag(false); Text("Do not crawl URLs blocked by robots.txt").tag(true) }; Text("Blocked URLs are always recorded with the matching Disallow rule for Overview and Audit.").font(.caption).foregroundStyle(.secondary); Toggle("Follow links marked nofollow", isOn: $settings.followNofollowLinks); Toggle("Crawl subdomains", isOn: $settings.crawlSubdomains); Toggle("Crawl URLs with parameters", isOn: $settings.crawlParameters); Section("Integrations · Ahrefs") { SecureField("Free Ahrefs API Key (for DR)", text: $ahrefsKey); Text("Stored locally in ShareSpider's Application Support folder.").font(.caption).foregroundStyle(.secondary) }; Section("Integrations · DataForSEO Backlinks") { TextField("API login", text: $dataForSEOLogin); SecureField("API password", text: $dataForSEOPassword); Text("Stored locally in ShareSpider's Application Support folder. Backlink enrichment runs only when you choose Refresh Backlink Data and is cached for 7 days.").font(.caption).foregroundStyle(.secondary) }; Section("Integrations · PageSpeed Insights") { SecureField("Optional Google API Key", text: $pageSpeedKey); Text("Stored locally in ShareSpider's Application Support folder. Leave blank to use the unauthenticated API quota.").font(.caption).foregroundStyle(.secondary) }; Section("Integrations · Google Search Console") { TextField("OAuth desktop client ID", text: $searchConsoleClientID); SecureField("OAuth client secret (optional)", text: $searchConsoleClientSecret); Text(searchConsole.status).font(.caption).foregroundStyle(searchConsole.isConnected ? .green : .secondary); HStack { Button(searchConsole.isAuthorizing ? "Waiting for Google…" : (searchConsole.isConnected ? "Reconnect" : "Connect Google Search Console")) { searchConsole.saveClient(clientID: searchConsoleClientID, clientSecret: searchConsoleClientSecret); Task { await searchConsole.authorize() } }.disabled(searchConsole.isAuthorizing); if searchConsole.isConnected { Button("Disconnect", role: .destructive) { searchConsole.disconnect() } } }; Text("Uses the configured Desktop OAuth client and requests read-only Search Console access. Credentials are stored locally by ShareSpider; no Keychain password is requested.").font(.caption).foregroundStyle(.secondary) }; Section("Integrations · Local visual model") { Toggle("Use local Ollama vision model", isOn: $localVision.enabled); TextField("Ollama endpoint", text: $localVision.endpoint); TextField("Vision model", text: $localVision.model); Text("Images remain on this Mac. Recommended starting model: qwen2.5vl:7b.").font(.caption).foregroundStyle(.secondary) } }; HStack { Spacer(); Button("Done") { PSIKeychain.save(pageSpeedKey); AhrefsKeychain.save(ahrefsKey); DataForSEOCredentials.save(login: dataForSEOLogin, password: dataForSEOPassword); searchConsole.saveClient(clientID: searchConsoleClientID, clientSecret: searchConsoleClientSecret); localVision.save(); dismiss() }.keyboardShortcut(.defaultAction) } }.padding().frame(width: 600) }
+    @State private var hermesSettings = HermesSettings.load()
+    @State private var hermesStatus = HermesConnectionStatus.notChecked
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Crawl Settings").font(.title2.weight(.semibold))
+            ScrollView(.vertical, showsIndicators: true) {
+                Form {
+                TextField("User-Agent", text: $settings.userAgent)
+                Picker("Concurrent requests", selection: $settings.concurrency) {
+                    ForEach([1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32], id: \.self) { count in
+                        Text("\(count) threads").tag(count)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text("5 threads is the recommended setting for a cautious site crawl.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Stepper("Timeout: \(Int(settings.timeout)) seconds", value: $settings.timeout, in: 5...120, step: 5)
+                Stepper("Maximum depth: \(settings.maxDepth)", value: $settings.maxDepth, in: 0...30)
+                Stepper("Maximum URLs: \(settings.maxURLs)", value: $settings.maxURLs, in: 10...100_000, step: 100)
+                Stepper("Visual audit pages: \(settings.visualAuditPageLimit)", value: $settings.visualAuditPageLimit, in: 1...8)
+                Picker("robots.txt crawl mode", selection: $settings.respectRobots) {
+                    Text("Crawl pages even when blocked (default)").tag(false)
+                    Text("Do not crawl URLs blocked by robots.txt").tag(true)
+                }
+                Toggle("Follow links marked nofollow", isOn: $settings.followNofollowLinks)
+                Toggle("Crawl subdomains", isOn: $settings.crawlSubdomains)
+                Toggle("Crawl URLs with parameters", isOn: $settings.crawlParameters)
+
+                GroupBox("Automatic integrations") {
+                    Toggle("Check crawled URLs through Google Search Console API", isOn: $settings.enableGSCURLInspection)
+                    Text("Off by default. Uses the URL Inspection API quota after the crawl has collected eligible canonical pages.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Import GSC site reports via Chrome / Playwright", isOn: $settings.enableGSCChromeReports)
+                    Toggle("Load per-page DataForSEO metrics after crawl", isOn: $settings.enableDataForSEO)
+                    Text("Page Indexing can begin alongside the crawl. Per-page DataForSEO metrics begin after the canonical URL list is ready.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("The donor-link profile (DataForSEO, Ahrefs, Ubersuggest and GSC Links) starts only from Backlinks after the crawl finishes. It never runs alongside the crawl.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                GroupBox("AI checks") {
+                    Picker("Deep-analysis agent", selection: $aiProviderSettings.agent) {
+                        ForEach(AuditAgent.allCases) { agent in
+                            Text(agent.title).tag(agent)
+                        }
+                    }
+                    Text(aiProviderSettings.agent.help).font(.caption).foregroundStyle(.secondary)
+                    Picker("Provider for standard AI checks", selection: $aiProviderSettings.provider) {
+                        ForEach(AIProvider.allCases, id: \.rawValue) { provider in
+                            Text(provider.title).tag(provider)
+                        }
+                    }
+                    Text(aiProviderSettings.provider.help).font(.caption).foregroundStyle(.secondary)
+                }
+                if aiProviderSettings.agent == .hermes {
+                    GroupBox("Hermes") {
+                        TextField("Hermes Endpoint", text: $hermesSettings.endpoint)
+                        SecureField("Hermes API key", text: $hermesSettings.apiKey)
+                        HStack {
+                            Text("Status: \(hermesStatus.message)")
+                                .foregroundStyle(hermesStatus.connected ? .green : .secondary)
+                            Spacer()
+                            Button("Test Connection") {
+                                Task { hermesStatus = await HermesConnector.shared.testConnection(settings: hermesSettings) }
+                            }
+                        }
+                        Text("Hermes uses one persistent local session for agent-led audit research. ShareSpider exposes only read-only project data through MCP.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("The Desktop dashboard is not the Agent API. The usual local Agent API endpoint is http://127.0.0.1:8642 and requires its API key.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                GroupBox("OpenRouter") {
+                    SecureField("OpenRouter API key", text: $openRouterKey)
+                    if openRouterKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("API key is not configured.").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("API key configured.").font(.caption).foregroundStyle(.green)
+                    }
+                    Text("Used only when OpenRouter is selected above. Stored locally in ShareSpider's Application Support folder; no Keychain password is requested.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Link("Open OpenRouter keys", destination: URL(string: "https://openrouter.ai/keys")!)
+                }
+                GroupBox("Integrations · DataForSEO Backlinks") {
+                    TextField("API login", text: $dataForSEOLogin)
+                    SecureField("API password", text: $dataForSEOPassword)
+                }
+                GroupBox("Integrations · Ahrefs") {
+                    SecureField("Ahrefs API key", text: $ahrefsKey)
+                    if ahrefsKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Optional. Configure a key to add Ahrefs Domain Rating to each audit.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("API key configured. Domain Rating is retrieved once per audit.")
+                            .font(.caption).foregroundStyle(.green)
+                    }
+                }
+                GroupBox("Integrations · Ubersuggest MCP") {
+                    Text("Endpoint: ubersuggest-mcp.neilpatelapi.com")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(ubersuggest.status)
+                        .font(.caption)
+                        .foregroundStyle(ubersuggest.isConnected ? .green : .secondary)
+                    HStack {
+                        Button(ubersuggest.isAuthorizing ? "Waiting for Ubersuggest…" : (ubersuggest.isConnected ? "Reconnect Ubersuggest" : "Connect Ubersuggest")) {
+                            Task { await ubersuggest.authorize() }
+                        }
+                        .disabled(ubersuggest.isAuthorizing)
+                        if ubersuggest.isConnected {
+                            Button("Test connection") { Task { await ubersuggest.testConnection() } }
+                            Button("Disconnect", role: .destructive) { ubersuggest.disconnect() }
+                        }
+                    }
+                    Text("Ubersuggest opens its own authorization page. ShareSpider requests only the backlink scope and stores the local refresh token securely for later comparisons.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                GroupBox("Integrations · PageSpeed Insights") {
+                    SecureField("Optional Google API Key", text: $pageSpeedKey)
+                    Text("Stored locally in ShareSpider's Application Support folder. Leave blank to use the unauthenticated API quota.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                GroupBox("Integrations · Google Search Console") {
+                    TextField("OAuth desktop client ID", text: $searchConsoleClientID)
+                    SecureField("OAuth client secret (optional)", text: $searchConsoleClientSecret)
+                    Text(searchConsole.status).font(.caption).foregroundStyle(searchConsole.isConnected ? .green : .secondary)
+                    HStack {
+                        Button(searchConsole.isAuthorizing ? "Waiting for Google…" : (searchConsole.isConnected ? "Reconnect" : "Connect Google Search Console")) {
+                            searchConsole.saveClient(clientID: searchConsoleClientID, clientSecret: searchConsoleClientSecret)
+                            Task { await searchConsole.authorize() }
+                        }
+                        .disabled(searchConsole.isAuthorizing)
+                        if searchConsole.isConnected {
+                            Button("Disconnect", role: .destructive) { searchConsole.disconnect() }
+                        }
+                    }
+                }
+                GroupBox("Integrations · Local Ollama") {
+                    Toggle("Use local Ollama vision model", isOn: $localVision.enabled)
+                    TextField("Ollama endpoint", text: $localVision.endpoint)
+                    TextField("Ollama model", text: $localVision.model)
+                    Text("Selected for local AI checks and visual analysis. Images remain on this Mac. Recommended starting model: qwen2.5vl:7b.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                }
+                .formStyle(.grouped)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            HStack {
+                Spacer()
+                Button("Save") {
+                    PSIKeychain.save(pageSpeedKey)
+                    OpenRouterKeychain.save(openRouterKey)
+                    AhrefsKeychain.save(ahrefsKey)
+                    aiProviderSettings.save()
+                    hermesSettings.save()
+                    DataForSEOCredentials.save(login: dataForSEOLogin, password: dataForSEOPassword)
+                    CrawlSettingsStore.save(settings)
+                    searchConsole.saveClient(clientID: searchConsoleClientID, clientSecret: searchConsoleClientSecret)
+                    localVision.save()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+        .frame(width: 680, height: 680)
+    }
 }

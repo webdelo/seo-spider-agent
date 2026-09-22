@@ -14,6 +14,7 @@ enum AhrefsKeychain {
     static func load() -> String {
         (try? String(contentsOf: keyURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
+    static var isConfigured: Bool { !load().isEmpty }
     static func save(_ key: String) {
         let value = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { try? FileManager.default.removeItem(at: keyURL); return }
@@ -25,16 +26,17 @@ enum AhrefsKeychain {
 enum SiteDiagnostics {
     static func domainRating(host: String) async -> (value: Double?, error: String) {
         let key = AhrefsKeychain.load()
-        guard !key.isEmpty else { return (nil, "Add a free Ahrefs API key in Settings → Integrations to retrieve DR.") }
+        guard !key.isEmpty else { return (nil, "Ahrefs API key is not configured.") }
         var components = URLComponents(string: "https://api.ahrefs.com/v3/public/domain-rating-free")!
         components.queryItems = [URLQueryItem(name: "target", value: host), URLQueryItem(name: "output", value: "json")]
         var request = URLRequest(url: components.url!); request.setValue("application/json", forHTTPHeaderField: "Accept"); request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard (200..<300).contains(status) else { return (nil, status == 401 ? "Ahrefs rejected the API key. Add a valid free API key in Settings → Integrations." : "Ahrefs DR request failed (HTTP \(status)).") }
+            guard (200..<300).contains(status) else { return (nil, status == 401 ? "Ahrefs rejected the API key." : "Ahrefs DR request failed (HTTP \(status)).") }
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            let rating = (json?["domain_rating"] as? [String: Any])?["domain_rating"] as? Double
+            let rawRating = (json?["domain_rating"] as? [String: Any])?["domain_rating"]
+            let rating = (rawRating as? NSNumber)?.doubleValue ?? (rawRating as? String).flatMap(Double.init)
             return rating.map { ($0, "") } ?? (nil, "Ahrefs did not return a Domain Rating value.")
         } catch { return (nil, error.localizedDescription) }
     }

@@ -2,7 +2,7 @@ import Foundation
 
 @MainActor
 enum AICodexAnalyst {
-    struct CustomAnalysis: Identifiable, Sendable, Codable {
+    struct CustomAnalysis: Identifiable, Sendable, Codable, Hashable {
         var id: UUID = UUID()
         var question: String
         var reasonForAnalysis: String
@@ -35,10 +35,10 @@ enum AICodexAnalyst {
         var analyses: [CustomAnalysis] = []
         for (index, prompt) in limited.enumerated() {
             let relevantData = subset(of: context, named: prompt.sourceData)
-            let key = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"]
+            let key = OpenRouterKeychain.load()
             let raw: String
             let model: String
-            if prompt.needsLLM, let key, !key.isEmpty {
+            if prompt.needsLLM, !key.isEmpty {
                 raw = (try? await openRouter(key: key, question: prompt.question, data: relevantData)) ?? ""
                 model = raw.isEmpty ? "codex" : "combined"
             } else if prompt.needsLLM {
@@ -87,18 +87,25 @@ enum AICodexAnalyst {
     }
     private static func runCodex(_ prompt: String) async -> String? {
         await Task.detached(priority: .utility) {
+            let paths = [
+                "/Applications/ChatGPT.app/Contents/Resources/codex",
+                "/Applications/Codex.app/Contents/Resources/codex",
+                "/opt/homebrew/bin/codex",
+                "/usr/local/bin/codex"
+            ]
+            guard let path = paths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
             let process = Process(), output = Pipe(), error = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["codex", "exec", "--sandbox", "danger-full-access", prompt]
-            var environment = ProcessInfo.processInfo.environment
-            environment["PATH"] = "\(NSHomeDirectory())/.npm-global/bin:\(environment["PATH"] ?? "")"
-            process.environment = environment; process.standardOutput = output; process.standardError = error
+            let resultURL = FileManager.default.temporaryDirectory.appendingPathComponent("sharespider-ai-custom-\(UUID().uuidString).txt")
+            defer { try? FileManager.default.removeItem(at: resultURL) }
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", resultURL.path, prompt]
+            process.standardOutput = output; process.standardError = error
             do { try process.run() } catch { return nil }
             let deadline = Date().addingTimeInterval(300)
             while process.isRunning && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
             if process.isRunning { process.terminate(); return nil }
             guard process.terminationStatus == 0 else { return nil }
-            return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            return try? String(contentsOf: resultURL, encoding: .utf8)
         }.value
     }
 }

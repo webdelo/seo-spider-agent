@@ -56,15 +56,23 @@ struct ProjectRunChange: Hashable {
     var percentage: Int
 }
 
+struct JournalAIAudit: Codable, Hashable {
+    var generatedAt = Date()
+    var agent = "Codex"
+    var finalSummary = ""
+    var analyses: [AICodexAnalyst.CustomAnalysis] = []
+}
+
 struct ProjectRun: Identifiable, Codable, Hashable {
     var id = UUID(); var date = Date(); var urlCount = 0; var errors: [String: Int] = [:]
     var pageSpeed: [JournalPageSpeedMetric] = []
     var searchConsole: JournalSearchConsoleSummary? = nil
     var backlinks: JournalBacklinkSummary? = nil
-    init(id: UUID = UUID(), date: Date = Date(), urlCount: Int = 0, errors: [String: Int] = [:], pageSpeed: [JournalPageSpeedMetric] = [], searchConsole: JournalSearchConsoleSummary? = nil, backlinks: JournalBacklinkSummary? = nil) {
-        self.id = id; self.date = date; self.urlCount = urlCount; self.errors = errors; self.pageSpeed = pageSpeed; self.searchConsole = searchConsole; self.backlinks = backlinks
+    var aiAudit: JournalAIAudit? = nil
+    init(id: UUID = UUID(), date: Date = Date(), urlCount: Int = 0, errors: [String: Int] = [:], pageSpeed: [JournalPageSpeedMetric] = [], searchConsole: JournalSearchConsoleSummary? = nil, backlinks: JournalBacklinkSummary? = nil, aiAudit: JournalAIAudit? = nil) {
+        self.id = id; self.date = date; self.urlCount = urlCount; self.errors = errors; self.pageSpeed = pageSpeed; self.searchConsole = searchConsole; self.backlinks = backlinks; self.aiAudit = aiAudit
     }
-    enum CodingKeys: String, CodingKey { case id, date, urlCount, errors, pageSpeed, searchConsole, backlinks }
+    enum CodingKeys: String, CodingKey { case id, date, urlCount, errors, pageSpeed, searchConsole, backlinks, aiAudit }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
@@ -74,6 +82,7 @@ struct ProjectRun: Identifiable, Codable, Hashable {
         pageSpeed = try container.decodeIfPresent([JournalPageSpeedMetric].self, forKey: .pageSpeed) ?? []
         searchConsole = try container.decodeIfPresent(JournalSearchConsoleSummary.self, forKey: .searchConsole)
         backlinks = try container.decodeIfPresent(JournalBacklinkSummary.self, forKey: .backlinks)
+        aiAudit = try container.decodeIfPresent(JournalAIAudit.self, forKey: .aiAudit)
     }
 }
 
@@ -191,6 +200,12 @@ final class ProjectJournalStore: ObservableObject {
         for issue in issues where issue.count > 0 { counters[issue.name] = issue.count }
         objectWillChange.send()
         projects[projectIndex].runs[runIndex].errors = counters
+        save()
+    }
+    func updateAIAudit(startURL: String, report: AIAuditReport, agent: AuditAgent) {
+        guard let projectIndex = index(for: startURL), let runIndex = projects[projectIndex].runs.indices.last else { return }
+        objectWillChange.send()
+        projects[projectIndex].runs[runIndex].aiAudit = JournalAIAudit(generatedAt: report.generatedAt, agent: agent.title, finalSummary: report.verifiedSummary.isEmpty ? report.executiveSummary : report.verifiedSummary, analyses: report.customAnalyses)
         save()
     }
     func updatePageSpeed(startURL: String, results: [PageSpeedResult]) {

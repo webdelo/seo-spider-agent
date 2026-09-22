@@ -1,3 +1,22 @@
 .build/
 .swiftpm/
 DerivedData/
+build/
+.DS_Store
+
+# Locally generated distribution files and credentials.
+*.dmg
+*.zip
+.env
+.env.*
+!.env.example
+
+# The production bundle carries Node separately: its binary is larger than
+# GitHub's 100 MB per-file limit. Keep source and Playwright package tracked.
+Sources/ShareSpider/Runtime/node
+
+# Duplicate icon files generated during local asset conversion.
+AppBundle/Icon.iconset/icon_16x16@2x 2.png
+AppBundle/Icon.iconset/icon_32x32 2.png
+AppBundle/Icon.iconset/icon_32x32@2x 2.png
+AppBundle/Icon.iconset/icon_512x512@2x 2.png

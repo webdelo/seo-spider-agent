@@ -42,20 +42,45 @@ enum GSCBacklinkImportService {
 
     static func load(target: String) -> GSCBacklinkImport? {
         guard let data = try? Data(contentsOf: cacheURL(target: target)) else { return nil }
-        return try? JSONDecoder().decode(GSCBacklinkImport.self, from: data)
+        guard let cached = try? JSONDecoder().decode(GSCBacklinkImport.self, from: data) else { return nil }
+        // Repair the short-lived bad import produced by older builds that
+        // mistook the aggregate “Linking pages” count for a donor domain.
+        // Only do this for unmistakably invalid cache rows, and only from the
+        // fresh Chrome export the user has just requested.
+        guard cached.donors.contains(where: { !looksLikeDomain($0.sourceDomain) }) else { return cached }
+        let chromeExport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ShareSpider/gsc-chrome/gsc-links-export.csv")
+        guard let csv = try? String(contentsOf: chromeExport, encoding: .utf8),
+              let repaired = try? importCSV(csv, target: target) else {
+            return cached
+        }
+        return repaired
     }
 
     static func importCSV(_ source: String, target: String) throws -> GSCBacklinkImport {
         let rows = parseCSV(source).filter { !$0.allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } }
         guard let header = rows.first else { throw ImportError.emptyFile }
         let keys = header.map(normalizeHeader)
-        guard let domainIndex = firstIndex(in: keys, containing: ["linking site", "source domain", "source site", "referring domain", "ссылающийся сайт", "домен"])
-                ?? firstIndex(in: keys, containing: ["source page", "source url", "linking page", "ссылающаяся страница", "страница-источник"]) else {
+        // Top linking sites is an aggregate GSC CSV:
+        // Site, Linking pages, Target pages.
+        // Linking pages contains the phrase linking page, but is a number —
+        // never a source URL or donor domain. Prefer the exact Site field
+        // before accepting page-level export headers.
+        guard let domainIndex = firstExactIndex(in: keys, matching: [
+            "site", "linking site", "source domain", "source site",
+            "referring domain", "ссылающийся сайт", "домен"
+        ]) ?? firstIndex(in: keys, containing: [
+            "source domain", "source site", "referring domain",
+            "ссылающийся сайт", "домен"
+        ]) ?? firstExactIndex(in: keys, matching: [
+            "source page", "source url", "linking page",
+            "ссылающаяся страница", "страница-источник"
+        ]) else {
             throw ImportError.unsupportedFormat
         }
-        let sourceIndex = firstIndex(in: keys, containing: ["source page", "source url", "linking page", "ссылающаяся страница", "страница-источник"])
-        let targetIndex = firstIndex(in: keys, containing: ["target page", "target url", "linked page", "целевая страница", "целевой url"])
-        let countIndex = firstIndex(in: keys, containing: ["links", "link count", "количество ссылок", "ссылки"])
+        let sourceIndex = firstExactIndex(in: keys, matching: ["source page", "source url", "linking page", "ссылающаяся страница", "страница-источник"])
+        let targetIndex = firstExactIndex(in: keys, matching: ["target page", "target url", "linked page", "целевая страница", "целевой url"])
+        let countIndex = firstExactIndex(in: keys, matching: ["links", "link count", "linking pages", "количество ссылок", "ссылки"])
         var donors: [GSCBacklinkDonor] = []
         var unique = Set<String>()
         for row in rows.dropFirst() {
@@ -116,8 +141,15 @@ enum GSCBacklinkImportService {
     private static func normalizeHeader(_ value: String) -> String {
         value.lowercased().replacingOccurrences(of: "\u{feff}", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
+    private static func looksLikeDomain(_ raw: String) -> Bool {
+        let domain = normalizedDomain(raw)
+        return domain.contains(".") && domain.rangeOfCharacter(from: .letters) != nil
+    }
     private static func firstIndex(in values: [String], containing options: [String]) -> Int? {
         values.firstIndex { value in options.contains { value.localizedCaseInsensitiveContains($0) } }
+    }
+    private static func firstExactIndex(in values: [String], matching options: [String]) -> Int? {
+        values.firstIndex { value in options.contains { value == $0 } }
     }
 
     /// Handles quoted values and doubled quotes used by Search Console CSVs.

@@ -14,12 +14,14 @@ final class ChromeGSCCoreWebVitalsSync {
     private var status: URL { root.appendingPathComponent("gsc-core-web-vitals-status.json") }
     func start(target: String, progress: @escaping @MainActor (String, Int, Int) -> Void, completion: @escaping @MainActor (Result<String, Error>) -> Void) {
         guard let resources = Bundle.main.resourceURL else { completion(.failure(Error.unavailable)); return }
-        let helper = resources.appendingPathComponent("ShareSpider_ShareSpider.bundle/gsc-chrome-core-web-vitals-export.mjs")
+        let helper = resources.appendingPathComponent("SEOSpiderAgent_ShareSpider.bundle/gsc-chrome-core-web-vitals-export.mjs")
         guard FileManager.default.fileExists(atPath: helper.path) else { completion(.failure(Error.unavailable)); return }
         try? FileManager.default.removeItem(at: output); try? FileManager.default.removeItem(at: status)
         progress("Opening mobile Core Web Vitals in Chrome", 1, 3)
-        let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["node", helper.path, "--target", target, "--output", output.path, "--status", status.path]
+        let process = Process()
+        let node = ChromeGSCPageIndexingSync.nodeLaunch()
+        process.executableURL = node.executableURL
+        process.arguments = node.argumentsPrefix + [helper.path, "--target", target, "--output", output.path, "--status", status.path]
         process.environment = ChromeGSCPageIndexingSync.playwrightEnvironment()
         let stderr = Pipe(); process.standardError = stderr
         do { try process.run() } catch { completion(.failure(Error.failed(error.localizedDescription))); return }

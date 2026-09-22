@@ -2,7 +2,8 @@
 // Mobile-only Core Web Vitals export via the user-authorised Chrome profile.
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-const playwrightCorePath = process.env.SHARESPIDER_PLAYWRIGHT_CORE || '/Users/daniilspara/Documents/App/ShareSpider/MCP/node_modules/playwright-core/index.mjs';
+const playwrightCorePath = process.env.SHARESPIDER_PLAYWRIGHT_CORE;
+if (!playwrightCorePath) throw new Error('The bundled Playwright runtime is unavailable.');
 const { chromium } = await import(playwrightCorePath);
 const pairs = process.argv.slice(2); const arg = key => pairs[pairs.indexOf(key) + 1];
 const target = arg('--target'); const output = resolve(arg('--output')); const status = resolve(arg('--status'));

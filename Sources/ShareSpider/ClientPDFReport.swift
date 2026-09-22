@@ -98,7 +98,7 @@ private final class PDFRenderer {
         let cards: [(String, String)] = [
             ("CMS", report.siteProfile.cmsName),
             ("IP address", report.siteProfile.ipAddresses.isEmpty ? "Not resolved" : report.siteProfile.ipAddresses.joined(separator: ", ")),
-            ("Ahrefs DR", report.siteProfile.domainRating.map { String(format: "%.1f / 100", $0) } ?? "Unavailable")
+            ("Ahrefs DR", report.siteProfile.domainRating.map { String(format: "%.1f", $0) } ?? "Not available")
         ]
         let width = (page.width - margin * 2 - 16) / 3
         ensure(82); y -= 4

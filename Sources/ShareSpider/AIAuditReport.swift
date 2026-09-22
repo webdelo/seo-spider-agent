@@ -1,7 +1,7 @@
 import Foundation
 
 enum AIAuditStage: String, Sendable {
-    case notStarted, collectingData, linkAnalysis, technicalAnalysis, gscAnalysis, codexAnalysis, verification, executiveSummary, complete
+    case notStarted, collectingData, linkAnalysis, technicalAnalysis, gscAnalysis, agentAnalysis, verification, executiveSummary, complete
 }
 
 struct AIAuditFinding: Identifiable, Hashable, Sendable, Codable {
@@ -32,12 +32,14 @@ struct AIAuditReport: Sendable {
     var verifiedSummary: String = ""
     var rejectedFindings: [AICodexAnalyst.CustomAnalysis] { customAnalyses.filter { $0.status == "Rejected" } }
     var confirmedFindings: [AICodexAnalyst.CustomAnalysis] { customAnalyses.filter { $0.status == "Confirmed" || $0.status == "Partially confirmed" } }
+    var probableFindings: [AICodexAnalyst.CustomAnalysis] { customAnalyses.filter { $0.status == "Probable" || $0.status == "Likely" } }
 }
 
 struct AIAuditCrawlSummary: Sendable, Codable {
     var totalURLs: Int; var htmlPages: Int; var errorCount: Int; var redirectCount: Int
     var missingTitles: Int; var missingDescriptions: Int; var missingH1: Int; var missingCanonical: Int
     var missingAltText: Int; var averageResponseTime: Double; var pagesWithoutInlinks: Int
+    var sitemapURLs: Int; var sitemapAvailable: Bool; var successfulTitledPages: Int
 }
 
 struct AIAuditBacklinkSummary: Sendable, Codable {

@@ -1,0 +1,17 @@
+name = "seospider"
+# JavaScript ready for the Cloudflare dashboard's ES-module editor.
+main = "src/worker-module.js"
+compatibility_date = "2026-09-13"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sharespider-licenses"
+# Replace after creating the D1 database in Cloudflare.
+database_id = "a6641be1-9ede-485c-af60-4db363e2fc6c"
+
+# This limits activation and licence-validation attempts. Replace the namespace
+# ID only if you create another Cloudflare rate-limiter namespace.
+[[ratelimits]]
+name = "AUTH_RATE_LIMIT"
+namespace_id = "10001"
+simple = { limit = 10, period = 60 }

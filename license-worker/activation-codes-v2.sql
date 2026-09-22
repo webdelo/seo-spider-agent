@@ -1,0 +1,3 @@
+-- Deprecated: generic activation codes are no longer accepted by the Worker.
+-- Use `node issue-activation-codes.mjs person@example.com` instead. It creates
+-- long, one-time code hashes that are bound to that email and expire.

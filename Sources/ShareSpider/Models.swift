@@ -6,12 +6,14 @@ enum CrawlState: Equatable { case idle, crawling, paused, finished, stopped
 }
 enum URLKind: String, Codable { case internalURL = "Internal", external = "External" }
 
-struct CrawlSettings: Sendable {
-    /// A normal browser signature avoids false asset failures on CDNs that
-    /// selectively challenge unknown crawler user agents. ShareSpider remains
-    /// identifiable through its local UI and request rate controls.
-    var userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
-    var concurrency = 6
+struct CrawlSettings: Sendable, Codable {
+    /// The HTTP crawler identifies itself truthfully. Chrome CDP remains a
+    /// separately reported fallback transport when a domain needs it.
+    static let shareSpiderUserAgent = "ShareSpider/1.4 (macOS; HTTP crawler)"
+    static let legacySafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+    var userAgent = CrawlSettings.shareSpiderUserAgent
+    /// Conservative default for ordinary crawls.
+    var concurrency = 5
     var timeout: TimeInterval = 20
     var maxDepth = 5
     var maxURLs = 10_000
@@ -21,6 +23,36 @@ struct CrawlSettings: Sendable {
     var followNofollowLinks = false
     /// Visual audit is deliberately conservative by default: one representative URL.
     var visualAuditPageLimit = 1
+    /// URL Inspection consumes a per-property Google API quota, therefore it is
+    /// intentionally opt-in. Chrome reports are independent site-wide exports.
+    var enableGSCURLInspection = false
+    var enableGSCChromeReports = true
+    var enableDataForSEO = true
+    var enableGSCBacklinkSync = true
+}
+
+enum CrawlSettingsStore {
+    private static var file: URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ShareSpider", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root.appendingPathComponent("crawl-settings.json")
+    }
+    static func load() -> CrawlSettings {
+        guard let data = try? Data(contentsOf: file), var value = try? JSONDecoder().decode(CrawlSettings.self, from: data) else { return CrawlSettings() }
+        // Move only the previous built-in browser-like value to the transparent
+        // ShareSpider identity. Any intentionally configured custom UA stays.
+        if value.userAgent == CrawlSettings.legacySafariUserAgent {
+            value.userAgent = CrawlSettings.shareSpiderUserAgent
+            save(value)
+        }
+        return value
+    }
+    static func save(_ value: CrawlSettings) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        try? data.write(to: file, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
 }
 
 struct CrawlRecord: Identifiable, Hashable, Sendable {
@@ -36,6 +68,10 @@ struct CrawlRecord: Identifiable, Hashable, Sendable {
     /// This makes an error report actionable: it shows where to fix the link.
     var foundOnURLs: [URL] = []
     var responseTime: TimeInterval = 0
+    /// Bytes received over the network before HTTP content decoding. Zero means
+    /// the platform did not expose a reliable transfer measurement.
+    var transferredSize = 0
+    var contentEncoding = ""
     var size = 0
     var depth = 0
     var indexability = "Unknown"
@@ -68,6 +104,8 @@ struct CrawlRecord: Identifiable, Hashable, Sendable {
     var contentFingerprint = ""
     var schemaTypes: [String] = []
     var pageType = "Unknown"
+    /// A useful-for-AI subcategory while `pageType` stays grouped as AI Bust Page.
+    var aiBustCategory = ""
     var classificationConfidence: Double = 0
     var classificationEvidence: [String] = []
     var primarySchemaType = ""
@@ -121,17 +159,68 @@ struct CrawlRecord: Identifiable, Hashable, Sendable {
     /// WordPress head links which disclose technical endpoints or create avoidable
     /// duplicate feeds. These are only populated for HTML documents.
     var wordPressHeadFindings: [String] = []
+    /// Locally calculated page-resource and AI parsability measurements.
+    /// They are intentionally separate from PageSpeed and never call an AI API.
+    var htmlSize = 0
+    var cleanedHTMLSize = 0
+    var extractedTextSize = 0
+    var estimatedHTMLTokens = 0
+    var estimatedTextTokens = 0
+    var domNodeCount = 0
+    var inlineJavaScriptSize = 0
+    var inlineCSSSize = 0
+    var embeddedJSONSize = 0
+    var imageResourceSize = 0
+    var javascriptResourceSize = 0
+    var cssResourceSize = 0
+    var fontResourceSize = 0
+    var otherResourceSize = 0
+    var thirdPartyResourceSize = 0
+    var resourceRequestCount = 0
+    var pageWeight = 0
+    var weightStatus = "Not assessed"
+    var primaryWeightCause = "Unknown"
+    var aiParsability = "Not assessed"
+    var contentToHTMLRatio = 0.0
+    /// Resources referenced by the HTML document. They are retained so the
+    /// Page Weight audit can name the largest contributors rather than only
+    /// reporting a total.
+    var pageResources: [PageResource] = []
+    /// The original crawler response and an optional local-Chrome confirmation
+    /// are kept separately so an intermittent origin/WAF response never turns
+    /// into a misleading technical issue.
+    var originalStatus: Int? = nil
+    var cdpStatus: Int? = nil
+    var verificationResult = "Not required"
+    /// Transport that produced the final status shown to the user. A local CDP
+    /// session is used only after the HTTP circuit for this domain is open.
+    var transportUsed = "http"
+    /// A challenge/anti-bot response is retained separately from a real page
+    /// failure so the adaptive crawl gate can slow down before retrying.
+    var suspectedWAF = false
     var error = ""
     var securityHeaders: [String: String] = [:]
     var isHTML: Bool { contentType.lowercased().contains("text/html") }
     var isImagePath: Bool { ["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "ico", "bmp", "tif", "tiff"].contains(url.pathExtension.lowercased()) }
     /// A binary image is a crawl resource, even when it returns HTTP 200.
     var isImageResource: Bool { contentType.lowercased().trimmingCharacters(in: .whitespaces).hasPrefix("image/") }
+    var isPDFResource: Bool { url.pathExtension.lowercased() == "pdf" || contentType.lowercased().contains("application/pdf") }
     /// An image-looking URL can still be a real HTML page (for example a CMS rewrite).
     /// Only then is it eligible for page-level SEO checks, and only when it is successful.
     /// Page-level SEO checks apply only to successful HTML documents. Error
     /// templates and PDFs may be reachable URLs, but do not need canonicals.
-    var isSEOPage: Bool { isHTML && (statusCode ?? 0) / 100 == 2 }
+    var isVerifiedViaChrome: Bool { verificationResult == "Verified via Chrome" || verificationResult == "Fetched via Chrome CDP" }
+    var isPendingChromeVerification: Bool { verificationResult == "Chrome verification queued" }
+    /// A local browser timeout is a transport observation, not evidence that
+    /// the origin is broken. Keep it visible for diagnostics without turning
+    /// it into a client/server error or inflating the error counter.
+    var hasUnconfirmedCDPFailure: Bool {
+        transportUsed == "cdp" && statusCode == nil &&
+            ["Chrome CDP timed out", "Chrome CDP unavailable"].contains(verificationResult)
+    }
+    /// Chrome-confirmed pages are full SEO pages when their HTML was captured
+    /// and analysed; only an unavailable CDP body is excluded.
+    var isSEOPage: Bool { isHTML && !verificationResult.localizedCaseInsensitiveContains("content unavailable") && (statusCode ?? 0) / 100 == 2 }
     var isSchemaEligible: Bool { isSEOPage }
     var isCanonicalEligible: Bool { isSEOPage }
     /// Google APIs are queried only for successful, self-canonical HTML pages.
@@ -142,10 +231,25 @@ struct CrawlRecord: Identifiable, Hashable, Sendable {
         return !declared.isEmpty && declared == url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
     var isImageCandidate: Bool { isImagePath || isImageResource }
-    /// Shown in the URLs table. A binary image must never be presented as an unknown page type.
-    var displayPageType: String { isImageCandidate && !isSEOPage ? "Image" : pageType }
-    var statusText: String { statusCode.map(String.init) ?? (error.isEmpty ? "—" : "Error") }
+    /// AI Bust is one intentional page type. Its internal category remains
+    /// available to the analyser, but is not presented as a second taxonomy.
+    var displayPageType: String {
+        if isImageCandidate && !isSEOPage { return "Image" }
+        return pageType
+    }
+    var transportLabel: String { transportUsed == "cdp" ? "Chrome CDP" : "HTTP crawler" }
+    var statusText: String {
+        if hasUnconfirmedCDPFailure { return "Unconfirmed" }
+        return statusCode.map(String.init) ?? (error.isEmpty ? "—" : "Error")
+    }
     var hasRedirect: Bool { !redirectSources.isEmpty }
+}
+
+struct PageResource: Hashable, Sendable {
+    var url: String
+    var kind: String
+    var size: Int = 0
+    var thirdParty = false
 }
 
 struct CrawledImage: Hashable, Sendable { var url: String; var alt: String; var width: String; var height: String; var size: Int = 0 }
@@ -240,6 +344,11 @@ struct BacklinkSourceDetail: Identifiable, Codable, Hashable, Sendable {
     var platformTypes: [String] = []
     var semanticLocation = ""
     var linkType = ""
+    /// Determined by a lightweight donor-page fetch only for same-name domains
+    /// on a different TLD. This distinguishes an international/language site
+    /// group from an unrelated donor with a coincidentally similar name.
+    var hreflangLinksToTarget = false
+    var relatedDomainZone = false
     var id: String { sourceURL + "|" + targetURL + "|" + anchor }
 }
 struct BacklinkHistoryPoint: Identifiable, Codable, Hashable, Sendable {

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import SwiftUI
 
 private actor BatchSiteTracker {
@@ -14,7 +15,7 @@ final class CrawlViewModel: ObservableObject {
     @Published var mode: CrawlMode = .spider
     @Published var startText = "https://example.com"
     @Published var listText = ""
-    @Published var settings = CrawlSettings()
+    @Published var settings = CrawlSettingsStore.load()
     @Published var localVision = LocalVisionSettings.load()
     @Published private(set) var records: [CrawlRecord] = []
     /// These reports are intentionally cached. Rebuilding every metric after every
@@ -23,6 +24,7 @@ final class CrawlViewModel: ObservableObject {
     @Published private(set) var overview: [OverviewItem] = []
     @Published private(set) var state: CrawlState = .idle
     @Published private(set) var queued = 0
+    @Published private(set) var stageProgress = CrawlStageProgress()
     @Published private(set) var startedAt: Date?
     @Published var selectedIssue: Issue?
     @Published private(set) var overviewSelectionName: String?
@@ -51,12 +53,42 @@ final class CrawlViewModel: ObservableObject {
     @Published private(set) var backlinkProgress = 0
     @Published private(set) var backlinkTotal = 0
     @Published private(set) var backlinkMessage = ""
+    @Published private(set) var dataForSEOProfileMessage = "Not started"
+    @Published private(set) var dataForSEOProfileClassifying = false
     @Published private(set) var backlinkDrilldownKind: BacklinkDrilldownKind?
     @Published private(set) var backlinkDrilldownRunning = false
     @Published private(set) var referringDomainDetails: [ReferringDomainDetail] = []
     @Published private(set) var backlinkSourceDetails: [BacklinkSourceDetail] = []
     @Published private(set) var backlinkHistory: [BacklinkHistoryPoint] = []
     @Published private(set) var gscBacklinkImport: GSCBacklinkImport?
+    @Published private(set) var ahrefsBacklinkImport: AhrefsBacklinkImport?
+    @Published private(set) var ubersuggestBacklinkImport: UbersuggestBacklinkImport?
+    @Published private(set) var ahrefsComparisonRunning = false
+    @Published private(set) var ubersuggestComparisonRunning = false
+    @Published private(set) var ahrefsComparisonProgress = 0
+    @Published private(set) var ahrefsComparisonTotal = 1
+    @Published private(set) var ahrefsComparisonMessage = "Not started"
+    @Published private(set) var ubersuggestComparisonProgress = 0
+    @Published private(set) var ubersuggestComparisonTotal = 1
+    @Published private(set) var ubersuggestComparisonMessage = "Not started"
+    /// Domain-only providers are profiled after their download finishes.  The
+    /// results are deliberately kept separate from DataForSEO's page-level
+    /// classifications so the UI never pretends a donor homepage is the exact
+    /// page carrying the backlink.
+    @Published private(set) var ahrefsSourceStats = BacklinkSourceStats()
+    @Published private(set) var ubersuggestSourceStats = BacklinkSourceStats()
+    @Published private(set) var gscSourceStats = BacklinkSourceStats()
+    @Published private(set) var ahrefsProfileClassifying = false
+    @Published private(set) var ubersuggestProfileClassifying = false
+    @Published private(set) var gscProfileClassifying = false
+    @Published private(set) var gscBacklinkProgress = 0
+    @Published private(set) var gscBacklinkTotal = 3
+    @Published private(set) var gscBacklinkStage = "Not started"
+    var backlinkComparisonRunning: Bool { ahrefsComparisonRunning || ubersuggestComparisonRunning }
+    var backlinkProfileAnalysisRunning: Bool {
+        backlinkDrilldownRunning || ahrefsComparisonRunning || ubersuggestComparisonRunning || gscChromeLinkSyncRunning ||
+        ahrefsProfileClassifying || ubersuggestProfileClassifying || gscProfileClassifying
+    }
     @Published private(set) var gscSiteReport: GSCSiteReport?
     @Published private(set) var gscCoreWebVitalsReport: GSCCoreWebVitalsReport?
     @Published private(set) var gscChromeLinkSyncRunning = false
@@ -81,6 +113,8 @@ final class CrawlViewModel: ObservableObject {
     private var pageSpeedTask: Task<Void, Never>?
     private var backlinkTask: Task<Void, Never>?
     private var backlinkDetailTask: Task<Void, Never>?
+    private var donorProfileTasks: [DonorProfileSource: Task<Void, Never>] = [:]
+    private var donorProfileTarget = ""
     /// The journal entry that belongs to the currently running GSC job.  A new
     /// crawl must never silently inherit an inspection still running for the
     /// previous site.
@@ -91,9 +125,15 @@ final class CrawlViewModel: ObservableObject {
     private var recordIndexByURL: [String: Int] = [:]
     private var inlinkCounts: [String: Int] = [:]
     private var cachedErrors = 0
+    private var lastDiagnosticWrite = Date.distantPast
+    private var speedSamples: [(TimeInterval, Int)] = []
     /// Set only for an MCP-launched scan. It is consumed when that crawl ends so
     /// a subsequent manual Start does not unexpectedly spend Search Console quota.
     private var inspectSearchConsoleAfterCrawl = false
+    /// An access denial is a property-level fact, not a transient request
+    /// failure.  Keep it for the lifetime of this project run so that the
+    /// other GSC entry points cannot reopen Chrome or retry the same property.
+    private var gscAccessDeniedTarget = ""
     /// Used by MCP for an atomic crawl → audit workflow.  It prevents an audit
     /// from being started against a SQLite-restored URL list, which deliberately
     /// does not retain parsed hreflang markup.
@@ -101,22 +141,68 @@ final class CrawlViewModel: ObservableObject {
     /// Keeps WebKit and its callbacks alive for the complete visual-audit session.
     private var visualAuditor: WebKitVisualAudit?
     private let crawler = SpiderCrawler()
+    /// Injected by the root view. A crawl can never begin without an online
+    /// licence confirmation from the Worker.
+    weak var licenseManager: LicenseManager?
+    @Published private(set) var licenseCheckRunning = false
+
+    private enum DonorProfileSource: Hashable {
+        case ahrefs
+        case ubersuggest
+        case searchConsole
+    }
 
     /// Google returns an ordinary-looking error response for a property the
     /// signed-in account cannot read. Continuing URL by URL only wastes the
     /// daily inspection quota and leaves the journal stuck in "Checking…".
     private func isGSCPropertyAccessDenied(_ error: Error) -> Bool {
         let text = error.localizedDescription.lowercased()
-        return text.contains("don't have access to this property") ||
+        return text.contains("access denied") ||
+            text.contains("don't have access to this property") ||
             text.contains("do not have access to this property") ||
+            text.contains("access to this property") ||
             text.contains("insufficient permission") ||
             text.contains("permission denied") ||
             text.contains("not authorized") ||
             text.contains("not authorised")
     }
 
+    private func gscTargetKey(_ value: String) -> String {
+        let qualified = value.contains("://") ? value : "https://\(value)"
+        return URL(string: qualified)?.host?.lowercased() ?? value.lowercased()
+    }
+
+    private func isGSCBlocked(for target: String) -> Bool {
+        !gscAccessDeniedTarget.isEmpty && gscAccessDeniedTarget == gscTargetKey(target)
+    }
+
+    private func blockGSCForCurrentTarget(reason: String) {
+        let target = gscTargetKey(startText)
+        guard !target.isEmpty else { return }
+        let isFirstAccessDenial = gscAccessDeniedTarget != target
+        gscAccessDeniedTarget = target
+        if isFirstAccessDenial {
+            // Links, Page Indexing and Core Web Vitals share this dedicated
+            // profile. Closing it ends any already-open helper as well.
+            ChromeGSCLinkSync.shared.closeDedicatedChromeAfterAccessDenied()
+        }
+        searchConsoleTask?.cancel()
+        searchConsoleTask = nil
+        searchConsoleRunning = false
+        searchConsoleJobStartURL = nil
+        let message = "Остановлено: нет доступа к свойству Google Search Console. Повторные обращения и новые окна Chrome для \(target) отключены до следующего запуска проверки."
+        searchConsoleMessage = message
+        gscChromeStage = "Google Search Console: stopped — no access to this property"
+        gscBacklinkStage = "Stopped: no access to this Search Console property"
+        backlinkMessage = message
+        ProjectJournalStore.shared.updateSearchConsole(startURL: startText, records: records, unavailableReason: reason)
+    }
+
     var errors: Int { cachedErrors }
-    var speed: String { guard let startedAt, Date().timeIntervalSince(startedAt) > 0 else { return "0 URL/s" }; return String(format: "%.1f URL/s", Double(records.count) / Date().timeIntervalSince(startedAt)) }
+    var speed: String {
+        guard let first = speedSamples.first, let last = speedSamples.last, last.0 - first.0 >= 1 else { return "Measuring speed…" }
+        return String(format: "%.1f URL/s · last 60s", Double(last.1 - first.1) / (last.0 - first.0))
+    }
     var progress: Double { settings.maxURLs == 0 ? 0 : min(1, Double(records.count) / Double(settings.maxURLs)) }
     /// The queue grows and shrinks while links are discovered. This is an honest
     /// estimate rather than a false percentage based on the configured URL limit.
@@ -131,6 +217,22 @@ final class CrawlViewModel: ObservableObject {
     }
 
     func start() {
+        guard !licenseCheckRunning else { return }
+        guard let licenseManager else { state = .idle; return }
+        licenseCheckRunning = true
+        Task { [weak self, weak licenseManager] in
+            defer { self?.licenseCheckRunning = false }
+            guard let self, let licenseManager, await licenseManager.validateForNewCrawl() else { return }
+            if self.state == .paused {
+                await self.crawler.pause(false)
+                self.state = .crawling
+            } else {
+                self.startLicensedCrawl()
+            }
+        }
+    }
+
+    private func startLicensedCrawl() {
         let raw = mode == .spider ? [startText] : listText.components(separatedBy: .newlines)
         let urls = raw.compactMap { value -> URL? in
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -142,55 +244,94 @@ final class CrawlViewModel: ObservableObject {
         // bare host or a complete URL. This keeps PageSpeed and GSC updates in
         // the existing project history instead of creating a second project.
         if mode == .spider, let first = urls.first { startText = first.absoluteString }
-        gscBacklinkImport = GSCBacklinkImportService.load(target: startText)
+        // A new crawl is a new explicit request. It may be for a different
+        // property, so do not carry a previous run's access refusal into it.
+        gscAccessDeniedTarget = ""
+        loadBacklinkImportsForCurrentTarget()
         gscSiteReport = GSCSiteReportImport.load(target: startText)
         gscCoreWebVitalsReport = GSCCoreWebVitalsImport.load(target: startText)
-        if state == .paused { Task { await crawler.pause(false) }; state = .crawling; return }
         cancelPostCrawlChecksForNewCrawl()
         resetCrawlResults(); queued = urls.count; startedAt = Date(); state = .crawling
+        // The crawl has a durable home before the first request.  This keeps a
+        // large project recoverable even if the application is stopped while
+        // secondary queues (Page Weight, GSC, Chrome) are still running.
+        _ = SessionStore.shared.beginRun(startURL: startText, date: startedAt ?? Date())
+        let diagnosticsLog = CrawlDiagnosticsLog(startURL: startText, date: startedAt ?? Date())
+        stageProgress = CrawlStageProgress()
+        speedSamples = [(ProcessInfo.processInfo.systemUptime, 0)]
         let selectedMode = mode; let selectedSettings = settings
+        Task { await diagnosticsLog.configuration(settings: selectedSettings) }
+        launchConfiguredIntegrationsAtCrawlStart()
         task = Task { [weak self, crawler] in
             await crawler.crawl(seeds: urls, mode: selectedMode, settings: selectedSettings, onRecord: { record in
                 await MainActor.run {
                     self?.enqueue(record, maximum: selectedSettings.maxURLs)
                 }
-            }, onQueue: { count in await MainActor.run { self?.queued = count } })
+            }, onQueue: { count in await MainActor.run { self?.queued = count } }, onStages: { progress in
+                await MainActor.run {
+                    self?.stageProgress = progress
+                    self?.writeCrawlDiagnostics()
+                }
+            }, onDiagnostic: { record, event in
+                await diagnosticsLog.record(record, event: event)
+            })
             await MainActor.run {
                 guard let self, self.state != .stopped else { return }
                 self.flushPendingRecords()
+                // Localised variants are the same logical page. Normalise their
+                // classification once the full crawl graph is available, rather
+                // than letting translated titles produce conflicting page types.
+                self.synchronizeHreflangPageTypes()
+                SessionStore.shared.persist(self.records)
                 let finalRecords = self.records
                 let crawlStartURL = self.startText
-                SessionStore.shared.save(startURL: crawlStartURL, records: finalRecords)
+                SessionStore.shared.finishRun()
                 AutomationBridge.logPerformance(site: crawlStartURL, stage: "crawl", duration: Date().timeIntervalSince(self.startedAt ?? Date()), urlCount: finalRecords.count)
                 // Keep a run in the journal immediately. This lets PageSpeed
                 // and Search Console write their independent results while the
                 // CPU-heavy issue aggregation runs in the background.
                 if let projectID = self.activeProjectID { ProjectJournalStore.shared.record(projectID: projectID, records: finalRecords, issues: self.issues) }
                 else { ProjectJournalStore.shared.record(startURL: crawlStartURL, records: finalRecords, issues: self.issues) }
-                // Once the user has connected GSC, a completed crawl is also a
-                // complete project measurement.  Do not require a second click
-                // in the URLs tab to populate the journal and report columns.
-                let shouldInspectSearchConsole = self.inspectSearchConsoleAfterCrawl || SearchConsoleAuth.shared.isConnected
+                // URL Inspection is a quota-bound per-URL API, unlike Chrome
+                // Page Indexing / Links exports. It is explicitly opt-in.
+                let shouldInspectSearchConsole = self.inspectSearchConsoleAfterCrawl || self.settings.enableGSCURLInspection
                 self.inspectSearchConsoleAfterCrawl = false
                 let shouldRunAudit = self.runAuditAfterCrawl
                 self.runAuditAfterCrawl = false
                 self.state = .finished; self.queued = 0
                 if shouldInspectSearchConsole {
                     self.inspectSearchConsole(urlIDs: Set(finalRecords.map(\.id)))
-                    // Search Analytics / URL Inspection uses the API, while
-                    // Page Indexing is Google's whole-site report and is
-                    // collected through the signed-in local Chrome profile.
-                    // Start it immediately after the crawl instead of making
-                    // the user wait for a second button. Both measurements are
-                    // independent and their results refresh Overview when they
-                    // arrive.
-                    self.syncGSCPageIndexingThroughChrome()
                 }
+                // Per-page DataForSEO enrichment uses the final canonical URL
+                // set. The optional donor-domain profile is deliberately a
+                // separate job, so this only fills page metrics.
+                if self.settings.enableDataForSEO { self.refreshBacklinkData(force: false) }
                 self.runPageSpeed()
                 self.finishSummariesInBackground(records: finalRecords, startURL: crawlStartURL)
                 if shouldRunAudit { self.runAudit() }
             }
         }
+    }
+
+    /// Site-wide integrations do not need the finished crawl result. Starting
+    private func writeCrawlDiagnostics() {
+        guard Date().timeIntervalSince(lastDiagnosticWrite) >= 2 else { return }
+        lastDiagnosticWrite = Date()
+        let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ShareSpider/crawl-progress.json")
+        let payload: [String: Any] = ["site": startText, "updatedAt": Date().timeIntervalSince1970, "elapsed": Date().timeIntervalSince(startedAt ?? Date()), "records": records.count, "queued": queued, "httpCompleted": stageProgress.htmlCompleted, "httpFinished": stageProgress.htmlFinished, "weightCompleted": stageProgress.weightCompleted, "weightTotal": stageProgress.weightTotal, "weightPartial": stageProgress.weightPartial, "weightActive": stageProgress.weightActive]
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
+            try? data.write(to: url, options: .atomic)
+            // The application-support copy is kept for local automation;
+            // the run-folder copy is the user-visible durable progress file.
+            SessionStore.shared.writeProgress(data)
+        }
+    }
+
+    /// Site-wide Search Console reports do not need the finished crawl result.
+    /// Full donor-profile work is intentionally excluded: it starts only from
+    /// the Backlinks tab and never overlaps a crawl.
+    private func launchConfiguredIntegrationsAtCrawlStart() {
+        if settings.enableGSCChromeReports { syncGSCPageIndexingThroughChrome() }
     }
 
     /// A second crawl can be started while PageSpeed/GSC is still finishing the
@@ -222,6 +363,20 @@ final class CrawlViewModel: ObservableObject {
             backlinkRunning = false
             backlinkMessage = "Previous backlink analysis was stopped for the new crawl."
         }
+        // The donor profile is a standalone Backlinks-tab task. Do not leave
+        // one running when a new crawl begins.
+        if backlinkDrilldownRunning {
+            backlinkDetailTask?.cancel()
+            backlinkDetailTask = nil
+            backlinkDrilldownRunning = false
+            dataForSEOProfileClassifying = false
+            dataForSEOProfileMessage = "Stopped for the new crawl."
+        }
+        donorProfileTasks.values.forEach { $0.cancel() }
+        donorProfileTasks.removeAll()
+        ahrefsProfileClassifying = false
+        ubersuggestProfileClassifying = false
+        gscProfileClassifying = false
     }
     func start(project: SEOProject) {
         mode = .spider
@@ -270,26 +425,72 @@ final class CrawlViewModel: ObservableObject {
         pendingRecordFlush?.cancel(); pendingRecordFlush = nil
         let batch = pendingRecords; pendingRecords.removeAll(keepingCapacity: true)
         guard !batch.isEmpty else { return }
-        for record in batch { merge(record, maximum: maximum) }
+        var updated = records
+        for record in batch { merge(record, into: &updated, maximum: maximum) }
+        records = updated
+        // Store the completed HTTP row or subsequent Page Weight/CDP update as
+        // it arrives.  Do not wait until the entire crawl is finished.
+        let persisted = Set(batch.map { $0.url.absoluteString }).compactMap { key in
+            recordIndexByURL[key].map { records[$0] }
+        }
+        SessionStore.shared.persist(persisted)
+        let tick = ProcessInfo.processInfo.systemUptime
+        if let previous = speedSamples.last, tick - previous.0 > 120 { speedSamples.removeAll() }
+        speedSamples.append((tick, stageProgress.htmlCompleted))
+        while speedSamples.count > 2 && tick - speedSamples[1].0 > 60 { speedSamples.removeFirst() }
         cachedErrors = records.reduce(into: 0) { count, record in
-            if !record.error.isEmpty || (record.statusCode ?? 0) >= 400 { count += 1 }
+            if !record.hasUnconfirmedCDPFailure && (!record.error.isEmpty || (record.statusCode ?? 0) >= 400) { count += 1 }
         }
         scheduleSummaryRefresh()
     }
 
     /// Inlinks are updated only for the source URL's targets. This replaces the
     /// previous full scan of every page and every link after every HTTP response.
-    private func merge(_ incoming: CrawlRecord, maximum: Int) {
+    private func merge(_ incoming: CrawlRecord, into records: inout [CrawlRecord], maximum: Int) {
         let key = incoming.url.absoluteString
-        if let existing = recordIndexByURL[key] {
+        if let existing = recordIndexByURL[key] ?? records.firstIndex(where: { $0.id == incoming.id }) {
+            // Redirect normalisation can change a URL string between the first
+            // response and Page Weight/CDP follow-up. The record UUID remains
+            // stable, so never append a duplicate row for that follow-up.
+            recordIndexByURL[key] = existing
+            if incoming.weightStatus == "Measured" || incoming.weightStatus == "Partial" {
+                // Aggregate Page Weight metrics retain the full measurement.
+                // The UI only ever renders the top resources, so retaining the
+                // heaviest 50 prevents a large catalogue page from permanently
+                // carrying thousands of asset rows in RAM.
+                records[existing].pageResources = Array(incoming.pageResources.sorted { $0.size > $1.size }.prefix(50))
+                records[existing].pageWeight = incoming.pageWeight
+                records[existing].weightStatus = incoming.weightStatus
+                records[existing].imageResourceSize = incoming.imageResourceSize
+                records[existing].javascriptResourceSize = incoming.javascriptResourceSize
+                records[existing].cssResourceSize = incoming.cssResourceSize
+                records[existing].fontResourceSize = incoming.fontResourceSize
+                records[existing].thirdPartyResourceSize = incoming.thirdPartyResourceSize
+                records[existing].primaryWeightCause = incoming.primaryWeightCause
+                records[existing].images = incoming.images
+            }
+            if incoming.originalStatus != nil || incoming.cdpStatus != nil || incoming.verificationResult != "Not required" {
+                records[existing].originalStatus = incoming.originalStatus
+                records[existing].cdpStatus = incoming.cdpStatus
+                records[existing].verificationResult = incoming.verificationResult
+                records[existing].statusCode = incoming.statusCode
+                records[existing].contentType = incoming.contentType
+                records[existing].error = incoming.error
+                records[existing].transportUsed = incoming.transportUsed
+                records[existing].suspectedWAF = incoming.suspectedWAF
+            }
             for source in incoming.redirectSources where !records[existing].redirectSources.contains(source) { records[existing].redirectSources.append(source) }
-            for source in incoming.foundOnURLs where !records[existing].foundOnURLs.contains(source) { records[existing].foundOnURLs.append(source) }
+            for source in incoming.foundOnURLs where !records[existing].foundOnURLs.contains(source) && records[existing].foundOnURLs.count < 20 { records[existing].foundOnURLs.append(source) }
             if records[existing].redirectURL == nil { records[existing].redirectURL = incoming.redirectURL; records[existing].redirectChain = incoming.redirectChain }
             return
         }
         guard records.count < maximum else { return }
         var record = incoming
         record.inlinks = inlinkCounts[key, default: 0]
+        // Targets have already been used to populate the crawl queue below;
+        // they are not needed by the post-crawl audit. Keep a bounded anchor
+        // sample for technical exports rather than every navigation link.
+        if record.outgoingLinks.count > 250 { record.outgoingLinks = Array(record.outgoingLinks.prefix(250)) }
         let index = records.count
         records.append(record)
         recordIndexByURL[key] = index
@@ -297,6 +498,54 @@ final class CrawlViewModel: ObservableObject {
             inlinkCounts[target, default: 0] += 1
             if let targetIndex = recordIndexByURL[target] {
                 records[targetIndex].inlinks = inlinkCounts[target, default: 0]
+            }
+        }
+        records[index].internalLinkTargets.removeAll(keepingCapacity: false)
+    }
+
+    /// Hreflang alternates are language/region variants of one logical page.
+    /// The strongest non-unknown classification in each connected group wins.
+    private func synchronizeHreflangPageTypes() {
+        func urlKey(_ url: URL) -> String {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.fragment = nil
+            let raw = (components?.url ?? url).absoluteString
+            return raw.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        }
+
+        var indexes: [String: Int] = [:]
+        for (index, record) in records.enumerated() { indexes[urlKey(record.url)] = index }
+        var neighbours = Array(repeating: Set<Int>(), count: records.count)
+        for (index, record) in records.enumerated() {
+            for link in record.hreflangTargets {
+                guard let target = URL(string: link.url), let other = indexes[urlKey(target)], other != index else { continue }
+                neighbours[index].insert(other)
+                neighbours[other].insert(index)
+            }
+        }
+
+        var visited = Set<Int>()
+        for start in records.indices where !visited.contains(start) && !neighbours[start].isEmpty {
+            var group: [Int] = []
+            var pending = [start]
+            visited.insert(start)
+            while let index = pending.popLast() {
+                group.append(index)
+                for next in neighbours[index] where !visited.contains(next) {
+                    visited.insert(next)
+                    pending.append(next)
+                }
+            }
+            guard let source = group
+                .map({ records[$0] })
+                .filter({ $0.pageType != "Unknown" })
+                .max(by: { $0.classificationConfidence < $1.classificationConfidence }) else { continue }
+            for index in group {
+                guard records[index].pageType != source.pageType || records[index].aiBustCategory != source.aiBustCategory else { continue }
+                records[index].pageType = source.pageType
+                records[index].aiBustCategory = source.aiBustCategory
+                records[index].classificationConfidence = source.classificationConfidence
+                records[index].classificationEvidence = ["Inherited from hreflang group: \(source.url.absoluteString)"]
             }
         }
     }
@@ -307,15 +556,17 @@ final class CrawlViewModel: ObservableObject {
         guard pendingSummaryRefresh == nil else { return }
         let snapshot = records
         let siteReport = gscSiteReport
+        let vitals = gscCoreWebVitalsReport
+        let backlinks = backlinkReport
         pendingSummaryRefresh = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(350))
+            try? await Task.sleep(for: .seconds(5))
             guard !Task.isCancelled else { return }
             let summaries = await Task.detached(priority: .utility) {
-                (IssueBuilder.make(snapshot, gscSiteReport: siteReport), OverviewBuilder.make(snapshot, gscSiteReport: siteReport))
+                (IssueBuilder.make(snapshot, gscSiteReport: siteReport, gscCoreWebVitalsReport: vitals), OverviewBuilder.make(snapshot, gscSiteReport: siteReport, gscCoreWebVitalsReport: vitals) + BacklinkOverviewBuilder.make(snapshot, report: backlinks))
             }.value
             guard !Task.isCancelled else { return }
             self?.issues = summaries.0
-            self?.overview = OverviewBuilder.make(snapshot, gscSiteReport: self?.gscSiteReport, gscCoreWebVitalsReport: self?.gscCoreWebVitalsReport) + BacklinkOverviewBuilder.make(snapshot, report: self?.backlinkReport)
+            self?.overview = summaries.1
             self?.pendingSummaryRefresh = nil
         }
     }
@@ -408,6 +659,243 @@ final class CrawlViewModel: ObservableObject {
         backlinkDetailTask?.cancel(); backlinkDetailTask = nil
         backlinkRunning = false; backlinkDrilldownRunning = false
         backlinkMessage = "Backlink analysis stopped."
+        dataForSEOProfileMessage = "Stopped"
+        dataForSEOProfileClassifying = false
+    }
+    /// Runs the complete donor-domain comparison as a standalone job. It does
+    /// not require crawl records, so it can be used from the Backlinks tab for
+    /// an existing project or a newly entered domain.
+    func runBacklinkProfileAnalysis() {
+        guard state != .crawling, state != .paused,
+              !startText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        loadBacklinkSourceAnalysis()
+        if AhrefsKeychain.isConfigured { loadAhrefsReferringDomains() }
+        if UbersuggestMCPAuth.shared.isConnected { loadUbersuggestReferringDomains() }
+        syncGSCBacklinksThroughChrome()
+    }
+
+    /// Cached source imports are useful without starting a new site crawl.
+    /// The Backlinks screen calls this when the target field changes, so a
+    /// reopened project immediately regains its already downloaded datasets.
+    func loadBacklinkImportsForCurrentTarget() {
+        let target = startText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+        if target != donorProfileTarget {
+            donorProfileTasks.values.forEach { $0.cancel() }
+            donorProfileTasks.removeAll()
+            donorProfileTarget = target
+            ahrefsSourceStats = BacklinkSourceStats()
+            ubersuggestSourceStats = BacklinkSourceStats()
+            gscSourceStats = BacklinkSourceStats()
+            ahrefsProfileClassifying = false
+            ubersuggestProfileClassifying = false
+            gscProfileClassifying = false
+        }
+        gscBacklinkImport = GSCBacklinkImportService.load(target: target)
+        ahrefsBacklinkImport = AhrefsBacklinkService.load(target: target)
+        ubersuggestBacklinkImport = UbersuggestBacklinkService.load(target: target)
+    }
+
+    /// Starts the lightweight, domain-level classification for every available
+    /// source. Search Console, Ahrefs and Ubersuggest do not expose the exact
+    /// linking page in these datasets, so the result is labelled as a donor
+    /// domain signal rather than a fact about an individual backlink.
+    func ensureDonorProfileClassification() {
+        loadBacklinkImportsForCurrentTarget()
+        if let report = ahrefsBacklinkImport {
+            beginDonorProfile(
+                .ahrefs,
+                domains: report.domains,
+                links: report.linkCount,
+                knownSpam: Set(report.spamDomains)
+            )
+        }
+        if let report = ubersuggestBacklinkImport {
+            beginDonorProfile(
+                .ubersuggest,
+                domains: report.domains,
+                links: report.linkCount,
+                knownSpam: Set(report.spamDomains)
+            )
+        }
+        if let report = gscBacklinkImport {
+            beginDonorProfile(
+                .searchConsole,
+                domains: report.donors.map(\.sourceDomain),
+                links: report.donors.reduce(0) { $0 + max(1, $1.links) }
+            )
+        }
+    }
+
+    private func beginDonorProfile(
+        _ source: DonorProfileSource,
+        domains: [String],
+        links: Int,
+        knownSpam: Set<String> = []
+    ) {
+        let normalizedDomains = Array(Set(domains.map(GSCBacklinkImportService.normalizedDomain).filter { !$0.isEmpty }))
+        guard !normalizedDomains.isEmpty, !isProfileClassifying(source) else { return }
+        if stats(for: source).donors == normalizedDomains.count { return }
+
+        donorProfileTasks[source]?.cancel()
+        setProfileClassifying(source, true)
+        updateProfileProgress(source, completed: 0, total: normalizedDomains.count, message: "Classifying donor domains…")
+        let expectedStartURL = startText
+        donorProfileTasks[source] = Task { [weak self] in
+            let result = await DonorDomainProfiler.profile(
+                domains: normalizedDomains,
+                links: links,
+                knownSpam: knownSpam
+            ) { [weak self] completed, total in
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self, self.startText == expectedStartURL else { return }
+                    self.updateProfileProgress(
+                        source,
+                        completed: completed,
+                        total: total,
+                        message: "Classifying donor domains: \(completed) / \(total)"
+                    )
+                }
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.startText == expectedStartURL else { return }
+                self.setStats(result, for: source)
+                self.setProfileClassifying(source, false)
+                self.updateProfileProgress(
+                    source,
+                    completed: result.donors,
+                    total: result.donors,
+                    message: "Loaded \(result.donors) donor domains · domain-level classification complete"
+                )
+                self.donorProfileTasks[source] = nil
+            }
+        }
+    }
+
+    private func stats(for source: DonorProfileSource) -> BacklinkSourceStats {
+        switch source {
+        case .ahrefs: ahrefsSourceStats
+        case .ubersuggest: ubersuggestSourceStats
+        case .searchConsole: gscSourceStats
+        }
+    }
+
+    private func setStats(_ stats: BacklinkSourceStats, for source: DonorProfileSource) {
+        switch source {
+        case .ahrefs: ahrefsSourceStats = stats
+        case .ubersuggest: ubersuggestSourceStats = stats
+        case .searchConsole: gscSourceStats = stats
+        }
+    }
+
+    private func isProfileClassifying(_ source: DonorProfileSource) -> Bool {
+        switch source {
+        case .ahrefs: ahrefsProfileClassifying
+        case .ubersuggest: ubersuggestProfileClassifying
+        case .searchConsole: gscProfileClassifying
+        }
+    }
+
+    private func setProfileClassifying(_ source: DonorProfileSource, _ value: Bool) {
+        switch source {
+        case .ahrefs: ahrefsProfileClassifying = value
+        case .ubersuggest: ubersuggestProfileClassifying = value
+        case .searchConsole: gscProfileClassifying = value
+        }
+    }
+
+    private func updateProfileProgress(_ source: DonorProfileSource, completed: Int, total: Int, message: String) {
+        switch source {
+        case .ahrefs:
+            ahrefsComparisonProgress = completed
+            ahrefsComparisonTotal = max(total, 1)
+            ahrefsComparisonMessage = message
+        case .ubersuggest:
+            ubersuggestComparisonProgress = completed
+            ubersuggestComparisonTotal = max(total, 1)
+            ubersuggestComparisonMessage = message
+        case .searchConsole:
+            gscBacklinkProgress = completed
+            gscBacklinkTotal = max(total, 1)
+            gscBacklinkStage = message
+        }
+    }
+    /// Explicit actions only: Ahrefs and Ubersuggest API/MCP queries can
+    /// consume the user's provider quota, so a routine site crawl never fires
+    /// them implicitly. Their cached snapshots remain available for charts.
+    func loadAhrefsReferringDomains() {
+        guard state != .crawling, state != .paused,
+              !ahrefsComparisonRunning, !startText.isEmpty else { return }
+        ahrefsComparisonRunning = true
+        ahrefsComparisonProgress = 0; ahrefsComparisonTotal = 1
+        ahrefsComparisonMessage = "Requesting referring domains…"
+        backlinkMessage = "Loading referring domains from Ahrefs…"
+        let target = startText
+        Task { [weak self] in
+            do {
+                let result = try await AhrefsBacklinkService.referringDomains(target: target) { progress in
+                    await MainActor.run {
+                        self?.ahrefsComparisonProgress = progress.completed
+                        self?.ahrefsComparisonTotal = max(progress.total, progress.completed, 1)
+                        self?.ahrefsComparisonMessage = progress.message
+                    }
+                }
+                await MainActor.run {
+                    guard let self, self.startText == target else { return }
+                    self.ahrefsBacklinkImport = result
+                    self.ahrefsComparisonRunning = false
+                    self.ahrefsComparisonProgress = 1
+                    self.ahrefsComparisonMessage = "Loaded \(result.domains.count) donor domains"
+                    self.backlinkMessage = "Loaded \(result.domains.count) Ahrefs referring domains for comparison."
+                    self.beginDonorProfile(
+                        .ahrefs,
+                        domains: result.domains,
+                        links: result.linkCount,
+                        knownSpam: Set(result.spamDomains)
+                    )
+                }
+            } catch {
+                await MainActor.run { self?.ahrefsComparisonRunning = false; self?.ahrefsComparisonMessage = "Failed: \(error.localizedDescription)"; self?.backlinkMessage = "Ahrefs comparison data unavailable: \(error.localizedDescription)" }
+            }
+        }
+    }
+    func loadUbersuggestReferringDomains() {
+        guard state != .crawling, state != .paused,
+              !ubersuggestComparisonRunning, !startText.isEmpty else { return }
+        ubersuggestComparisonRunning = true
+        ubersuggestComparisonProgress = 0; ubersuggestComparisonTotal = 1
+        ubersuggestComparisonMessage = "Requesting referring domains…"
+        backlinkMessage = "Loading referring domains from Ubersuggest MCP…"
+        let target = startText
+        Task { [weak self] in
+            do {
+                let result = try await UbersuggestBacklinkService.referringDomains(target: target) { progress in
+                    await MainActor.run {
+                        self?.ubersuggestComparisonProgress = progress.completed
+                        self?.ubersuggestComparisonTotal = max(progress.total, progress.completed, 1)
+                        self?.ubersuggestComparisonMessage = progress.message
+                    }
+                }
+                await MainActor.run {
+                    guard let self, self.startText == target else { return }
+                    self.ubersuggestBacklinkImport = result
+                    self.ubersuggestComparisonRunning = false
+                    self.ubersuggestComparisonProgress = 1
+                    self.ubersuggestComparisonMessage = "Loaded \(result.domains.count) donor domains"
+                    self.backlinkMessage = "Loaded \(result.domains.count) Ubersuggest referring domains for comparison."
+                    self.beginDonorProfile(
+                        .ubersuggest,
+                        domains: result.domains,
+                        links: result.linkCount,
+                        knownSpam: Set(result.spamDomains)
+                    )
+                }
+            } catch {
+                await MainActor.run { self?.ubersuggestComparisonRunning = false; self?.ubersuggestComparisonMessage = "Failed: \(error.localizedDescription)"; self?.backlinkMessage = "Ubersuggest comparison data unavailable: \(error.localizedDescription)" }
+            }
+        }
     }
     private func loadBacklinkDrilldown(_ kind: BacklinkDrilldownKind) {
         guard !backlinkDrilldownRunning else { return }
@@ -435,11 +923,13 @@ final class CrawlViewModel: ObservableObject {
     /// tab. It intentionally runs only on request: source-level data is much
     /// larger than the compact domain summary used during a regular crawl.
     func loadBacklinkSourceAnalysis() {
-        guard !backlinkDrilldownRunning, !startText.isEmpty else { return }
+        guard state != .crawling, state != .paused,
+              !backlinkDrilldownRunning, !startText.isEmpty else { return }
         backlinkDrilldownKind = .backlinks
         backlinkDrilldownRunning = true
         backlinkSourceDetails = []; backlinkHistory = []; backlinkProgress = 0; backlinkTotal = 0
         backlinkMessage = "Loading active, lost and historical links from DataForSEO…"
+        dataForSEOProfileMessage = backlinkMessage
         let target = startText
         backlinkDetailTask = Task { [weak self] in
             do {
@@ -448,6 +938,7 @@ final class CrawlViewModel: ObservableObject {
                         self?.backlinkProgress = progress.completed
                         self?.backlinkTotal = progress.total
                         self?.backlinkMessage = progress.message
+                        self?.dataForSEOProfileMessage = progress.message
                     }
                 }
                 // History availability depends on the DataForSEO plan.  It is
@@ -455,26 +946,38 @@ final class CrawlViewModel: ObservableObject {
                 // unavailable for this account.
                 let history = (try? await DataForSEOBacklinks.history(target: target)) ?? []
                 await MainActor.run {
-                    self?.backlinkSourceDetails = result
+                    self?.dataForSEOProfileClassifying = true
+                    self?.dataForSEOProfileMessage = "Classifying donor pages and checking probable language networks…"
+                }
+                let classified = await HreflangDonorInspector.inspect(result, target: target)
+                await MainActor.run {
+                    self?.backlinkSourceDetails = classified
                     self?.backlinkHistory = history
                     self?.backlinkDrilldownRunning = false
+                    self?.dataForSEOProfileClassifying = false
                     let active = result.filter { !$0.isLost }.count
                     let lost = result.count - active
-                    self?.backlinkMessage = history.isEmpty
+                    let message = history.isEmpty
                         ? "Loaded \(active) active and \(lost) lost donor links. Historical trend is unavailable for this DataForSEO account."
                         : "Loaded \(active) active and \(lost) lost donor links with historical trend."
+                    self?.backlinkMessage = message
+                    self?.dataForSEOProfileMessage = message
                     self?.backlinkDetailTask = nil
                 }
             } catch is CancellationError {
                 await MainActor.run {
                     self?.backlinkDrilldownRunning = false
+                    self?.dataForSEOProfileClassifying = false
                     self?.backlinkMessage = "Backlink source analysis stopped."
+                    self?.dataForSEOProfileMessage = "Stopped"
                     self?.backlinkDetailTask = nil
                 }
             } catch {
                 await MainActor.run {
                     self?.backlinkDrilldownRunning = false
+                    self?.dataForSEOProfileClassifying = false
                     self?.backlinkMessage = "Backlink source analysis unavailable: \(error.localizedDescription)"
+                    self?.dataForSEOProfileMessage = "Failed: \(error.localizedDescription)"
                     self?.backlinkDetailTask = nil
                 }
             }
@@ -495,16 +998,28 @@ final class CrawlViewModel: ObservableObject {
     /// a dedicated local Chrome profile plus Playwright to export the report,
     /// then feeds that CSV into the same importer as a manual export.
     func syncGSCBacklinksThroughChrome() {
-        guard !gscChromeLinkSyncRunning else { return }
+        // All Chrome-based GSC reports use the same dedicated profile and CDP
+        // port. Running two at once makes one helper close the other's page.
+        guard state != .crawling, state != .paused, !gscChromeSyncRunning else { return }
+        guard !isGSCBlocked(for: startText) else {
+            blockGSCForCurrentTarget(reason: "Google Search Console access was already denied during this check.")
+            return
+        }
         gscChromeLinkSyncRunning = true
         gscChromeProgress = 0
         gscChromeTotal = 3
+        gscBacklinkProgress = 0
+        gscBacklinkTotal = 3
+        gscBacklinkStage = "Opening Chrome"
         gscChromeStage = "Google Search Console · links: opening Chrome"
         backlinkMessage = "Opening the local ShareSpider Chrome profile and exporting the Google Search Console Links report…"
         ChromeGSCLinkSync.shared.start(target: startText, progress: { [weak self] message, completed, total in
             guard let self else { return }
             self.gscChromeProgress = completed
             self.gscChromeTotal = total
+            self.gscBacklinkProgress = completed
+            self.gscBacklinkTotal = total
+            self.gscBacklinkStage = message
             self.gscChromeStage = "Google Search Console · links: \(message)"
         }) { [weak self] result in
             guard let self else { return }
@@ -513,7 +1028,12 @@ final class CrawlViewModel: ObservableObject {
             case .success(let csv):
                 self.applyGSCBacklinkCSV(csv)
             case .failure(let error):
-                self.backlinkMessage = "Chrome GSC link sync is waiting: \(error.localizedDescription)"
+                if self.isGSCPropertyAccessDenied(error) {
+                    self.blockGSCForCurrentTarget(reason: error.localizedDescription)
+                } else {
+                    self.gscBacklinkStage = "Failed: \(error.localizedDescription)"
+                    self.backlinkMessage = "Chrome GSC link sync failed: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -526,7 +1046,11 @@ final class CrawlViewModel: ObservableObject {
     /// report represents Google's site-wide view, including URLs absent from
     /// this crawl, so it is imported as a separate GSC coverage dataset.
     func syncGSCPageIndexingThroughChrome() {
-        guard !gscChromePageIndexingSyncRunning else { return }
+        guard !gscChromeSyncRunning else { return }
+        guard !isGSCBlocked(for: startText) else {
+            blockGSCForCurrentTarget(reason: "Google Search Console access was already denied during this check.")
+            return
+        }
         gscChromePageIndexingSyncRunning = true
         gscChromeProgress = 0
         gscChromeTotal = 3
@@ -545,9 +1069,11 @@ final class CrawlViewModel: ObservableObject {
             case .failure(let error):
                 // Deliberately retain gscSiteReport and its journal snapshot.
                 let message = error.localizedDescription
-                self.searchConsoleMessage = message.localizedCaseInsensitiveContains("access denied")
-                    ? "Chrome Page Indexing stopped: \(message)"
-                    : "Chrome Page Indexing sync is waiting: \(message)"
+                if self.isGSCPropertyAccessDenied(error) {
+                    self.blockGSCForCurrentTarget(reason: message)
+                } else {
+                    self.searchConsoleMessage = "Chrome Page Indexing sync is waiting: \(message)"
+                }
             }
         }
     }
@@ -562,7 +1088,11 @@ final class CrawlViewModel: ObservableObject {
     }
     /// Imports mobile-only field-data groups from the Core Web Vitals report.
     func syncGSCCoreWebVitalsThroughChrome() {
-        guard !gscChromeCoreWebVitalsSyncRunning else { return }
+        guard !gscChromeSyncRunning else { return }
+        guard !isGSCBlocked(for: startText) else {
+            blockGSCForCurrentTarget(reason: "Google Search Console access was already denied during this check.")
+            return
+        }
         gscChromeCoreWebVitalsSyncRunning = true; gscChromeProgress = 0; gscChromeTotal = 3
         gscChromeStage = "Google Search Console · mobile Core Web Vitals: opening Chrome"
         ChromeGSCCoreWebVitalsSync.shared.start(target: startText, progress: { [weak self] message, completed, total in
@@ -581,9 +1111,11 @@ final class CrawlViewModel: ObservableObject {
                 } catch { self.searchConsoleMessage = "Core Web Vitals import unavailable: \(error.localizedDescription)" }
             case .failure(let error):
                 let message = error.localizedDescription
-                self.searchConsoleMessage = message.localizedCaseInsensitiveContains("access denied")
-                    ? "Chrome Core Web Vitals stopped: \(message)"
-                    : "Chrome Core Web Vitals sync is waiting: \(message)"
+                if self.isGSCPropertyAccessDenied(error) {
+                    self.blockGSCForCurrentTarget(reason: message)
+                } else {
+                    self.searchConsoleMessage = "Chrome Core Web Vitals sync is waiting: \(message)"
+                }
             }
         }
     }
@@ -597,8 +1129,16 @@ final class CrawlViewModel: ObservableObject {
         do {
             let imported = try GSCBacklinkImportService.importCSV(csv, target: startText)
             gscBacklinkImport = imported
+            gscBacklinkProgress = gscBacklinkTotal
+            gscBacklinkStage = "Imported \(imported.donors.count) donor records"
             backlinkMessage = "Imported \(imported.donors.count) Google Search Console donor records. DataForSEO remains the active/lost source."
+            beginDonorProfile(
+                .searchConsole,
+                domains: imported.donors.map(\.sourceDomain),
+                links: imported.donors.reduce(0) { $0 + max(1, $1.links) }
+            )
         } catch {
+            gscBacklinkStage = "Import failed: \(error.localizedDescription)"
             backlinkMessage = "Google Search Console link import unavailable: \(error.localizedDescription)"
         }
     }
@@ -650,14 +1190,19 @@ final class CrawlViewModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.aiAuditReport = report
             self?.customAnalyses = report.customAnalyses
+            ProjectJournalStore.shared.updateAIAudit(startURL: startURL, report: report, agent: AIProviderSettings.load().agent)
             self?.aiAuditRunning = false
         }
     }
     func exportAIAuditPDF() {
         guard let report = aiAuditReport else { return }
-        _ = AIAuditPDFReport.export(report: report, startURL: startText)
+        if let url = AIAuditPDFReport.export(report: report, startURL: startText) {
+            // Make a successful automatic export visible immediately; otherwise
+            // Finder-created PDF files are easy to mistake for a failed export.
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
     }
-    func exportTechnicalTasks(severity: TechnicalTaskPDFReport.Severity) {
+    func exportTechnicalTasks(severity: TechnicalTaskPDFReport.Severity = .highMedium) {
         guard !records.isEmpty else { return }
         // The task brief includes both crawl issues and technical findings that
         // were calculated in Audit (for example non-reciprocal hreflang).
@@ -666,14 +1211,29 @@ final class CrawlViewModel: ObservableObject {
             Issue(name: $0.title, type: "Audit", priority: $0.severity, urlIDs: $0.urlIDs)
         } ?? []
         let allTasks = issues + auditIssues
-        _ = TechnicalTaskPDFReport.export(records: records, issues: allTasks, startURL: startText, severity: severity)
+        if let url = TechnicalTaskPDFReport.export(records: records, issues: allTasks, startURL: startText, severity: severity) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
     }
     /// Each domain is crawled independently. A batch never shares a crawl queue,
     /// sitemap, robots policy or URL limit between client sites.
     /// Batch/scenario runs include Search Console coverage whenever the user has
     /// connected it.  This happens before both the PDFs and the journal entry
     /// are created, so the date column always describes one coherent check.
+    /// All batch, scheduled and deep-link launches converge here.  A batch is
+    /// one user-requested analysis, so it performs one online confirmation
+    /// before the first site starts rather than spending a request per URL.
     func runBatch(urlStrings: [String], kind: ScenarioReportKind, severity: TechnicalTaskPDFReport.Severity, outputDirectory: URL, includeSearchConsole: Bool? = nil) {
+        guard !batchRunning, !licenseCheckRunning, let licenseManager else { return }
+        licenseCheckRunning = true
+        Task { [weak self, weak licenseManager] in
+            defer { self?.licenseCheckRunning = false }
+            guard let self, let licenseManager, await licenseManager.validateForNewCrawl() else { return }
+            self.runLicensedBatch(urlStrings: urlStrings, kind: kind, severity: severity, outputDirectory: outputDirectory, includeSearchConsole: includeSearchConsole)
+        }
+    }
+
+    private func runLicensedBatch(urlStrings: [String], kind: ScenarioReportKind, severity: TechnicalTaskPDFReport.Severity, outputDirectory: URL, includeSearchConsole: Bool? = nil) {
         let urls = urlStrings.compactMap { raw -> URL? in
             let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return URL(string: clean.contains("://") ? clean : "https://" + clean)
@@ -703,7 +1263,10 @@ final class CrawlViewModel: ObservableObject {
                 let crawlStarted = Date()
                 await siteCrawler.crawl(seeds: [start], mode: .spider, settings: selectedSettings, onRecord: { record in
                     let siteProgress = await tracker.record()
-                    await MainActor.run { siteRecords.append(record) }
+                    await MainActor.run {
+                        if let index = siteRecords.firstIndex(where: { $0.id == record.id }) { siteRecords[index] = record }
+                        else { siteRecords.append(record) }
+                    }
                     let progress = BatchScenarioProgress(completed: completedBeforeSite, total: urls.count, currentSite: siteNames[index], currentSiteProgress: siteProgress, pendingSites: Array(siteNames[index...]), outputDirectory: reportsDirectory.path)
                     AutomationBridge.writeBatchStatus(progress)
                     await MainActor.run { self?.batchProgress = progress }
@@ -809,6 +1372,10 @@ final class CrawlViewModel: ObservableObject {
     /// respects Google's per-property inspection quota.
     func inspectSearchConsole(urlIDs: Set<UUID>) {
         guard !searchConsoleRunning else { return }
+        guard !isGSCBlocked(for: startText) else {
+            blockGSCForCurrentTarget(reason: "Google Search Console access was already denied during this check.")
+            return
+        }
         let targetIDs = urlIDs.isEmpty ? Set(records.map(\.id)) : urlIDs
         let targets = records.filter { targetIDs.contains($0.id) && $0.kind == .internalURL && $0.isGSCEligible }
         AutomationBridge.logPerformance(site: startText, stage: "search-console-command targets=\(targets.count)", duration: 0, urlCount: records.count)
@@ -863,6 +1430,10 @@ final class CrawlViewModel: ObservableObject {
             } catch {
                 guard !Task.isCancelled else { return }
                 let reason = error.localizedDescription
+                if self.isGSCPropertyAccessDenied(error) {
+                    self.blockGSCForCurrentTarget(reason: reason)
+                    return
+                }
                 self.records = self.markSearchConsoleUnavailable(self.records, targetIDs: targetIDs, reason: reason)
                 self.scheduleSummaryRefresh()
                 self.searchConsoleRunning = false
@@ -1123,17 +1694,41 @@ final class CrawlViewModel: ObservableObject {
 enum ExportScope: String, CaseIterable, Identifiable { case urls = "URLs", issues = "Issues", overview = "Overview", broken = "Broken links", redirects = "Redirects", imagesWithoutAlt = "Images without alt"; var id: String { rawValue } }
 
 enum IssueBuilder {
+    /// WordPress technical paths must be matched as path components. A simple
+    /// `contains("wp-")` misclassifies legitimate product slugs such as
+    /// `maybach-mb-the-majesty-ii-g-wp-z25` as crawler artefacts.
+    private static func isTechnicalSitemapURL(_ record: CrawlRecord) -> Bool {
+        if record.url.query != nil { return true }
+        let path = record.url.path.lowercased()
+        let components = path.split(separator: "/").map(String.init)
+        if components.contains(where: { ["wp-admin", "wp-content", "wp-includes"].contains($0) }) { return true }
+        return path == "/xmlrpc.php" || path.hasSuffix("/index.php")
+    }
+
     static func make(_ records: [CrawlRecord], gscSiteReport: GSCSiteReport? = nil, gscCoreWebVitalsReport: GSCCoreWebVitalsReport? = nil) -> [Issue] {
         func issue(_ name: String, _ type: String, _ priority: String, _ test: (CrawlRecord) -> Bool) -> Issue? { let ids = Set(records.filter(test).map(\.id)); return ids.isEmpty ? nil : Issue(name: name, type: type, priority: priority, urlIDs: ids) }
         func indexable(_ record: CrawlRecord) -> Bool { record.indexability == "Indexable" }
+        func finalHTTPFailure(_ record: CrawlRecord) -> Bool {
+            // A browser-side timeout/unavailability has no origin status to
+            // confirm. Surface it in the URL diagnostics, but never report it
+            // as a broken page merely because the local CDP transport failed.
+            if record.hasUnconfirmedCDPFailure { return false }
+            let status = record.statusCode ?? 0
+            if [403, 429].contains(status) || (500...599).contains(status) || record.suspectedWAF {
+                return !record.isPendingChromeVerification && !record.isVerifiedViaChrome
+            }
+            return !record.error.isEmpty || status >= 400
+        }
+        let pageWeightMedians = PageMetricsAnalyzer.typeMedians(records)
+        let fingerprintCounts = Dictionary(grouping: records.filter { indexable($0) && !$0.contentFingerprint.isEmpty }, by: \.contentFingerprint).mapValues(\.count)
         var result = [
-            issue("Internal server/client errors", "Issue", "High") { $0.kind == .internalURL && !$0.isImageCandidate && (!$0.error.isEmpty || ($0.statusCode ?? 0) >= 400) },
-            issue("Broken image resources", "Issue", "High") { $0.kind == .internalURL && $0.isImageCandidate && (!$0.error.isEmpty || ($0.statusCode ?? 0) >= 400) },
+            issue("Internal server/client errors", "Issue", "High") { $0.kind == .internalURL && !$0.isImageCandidate && finalHTTPFailure($0) },
+            issue("Broken image resources", "Issue", "High") { $0.kind == .internalURL && $0.isImageCandidate && finalHTTPFailure($0) },
             issue("Heavy image resources", "Warning", "Medium") { $0.kind == .internalURL && $0.isImageResource && ($0.statusCode ?? 0) / 100 == 2 && $0.size > 100_000 },
             issue("Internal redirects (3xx)", "Warning", "Medium") { $0.kind == .internalURL && $0.hasRedirect },
             issue("Missing page title", "Issue", "High") { indexable($0) && $0.isSEOPage && $0.title.isEmpty },
             issue("Missing meta description", "Warning", "Medium") { indexable($0) && $0.isSEOPage && $0.metaDescription.isEmpty },
-            issue("Missing H1", "Issue", "High") { indexable($0) && $0.isSEOPage && $0.h1.isEmpty },
+            issue("Missing H1", "Issue", "High") { indexable($0) && $0.isSEOPage && $0.h1Count == 0 },
             issue("Missing canonical", "Issue", "High") { indexable($0) && $0.isCanonicalEligible && $0.canonical.isEmpty },
             issue("Multiple canonical tags", "Issue", "High") { indexable($0) && $0.isCanonicalEligible && $0.canonicalCount > 1 },
             issue("Relative canonical URL", "Warning", "Medium") { indexable($0) && $0.isCanonicalEligible && !$0.canonicalRaw.isEmpty && !$0.canonicalRaw.contains("://") },
@@ -1152,11 +1747,11 @@ enum IssueBuilder {
             // other fetched resources can naturally have no HTML inlinks and
             // must never be reported as orphan pages.
             issue("Orphan pages", "Warning", "Medium") { $0.isSEOPage && $0.depth > 0 && $0.inlinks == 0 },
-            issue("Pages without internal outlinks", "Opportunity", "Low") { $0.isHTML && $0.internalLinks == 0 },
+            issue("Pages without internal outlinks", "Opportunity", "Low") { $0.isSEOPage && $0.internalLinks == 0 },
             issue("Pages without internal inlinks", "Opportunity", "Low") { $0.isSEOPage && $0.depth > 0 && $0.inlinks == 0 },
             issue("Noindex URLs in sitemap", "Warning", "Medium") { $0.inSitemap && $0.indexability == "Noindex" },
-            issue("Technical URLs in sitemap", "Warning", "Medium") { $0.inSitemap && ($0.url.query != nil || $0.url.path.contains("wp-") || $0.url.path.contains("index.")) },
-            issue("Duplicate content", "Warning", "Medium") { r in indexable(r) && !r.contentFingerprint.isEmpty && records.filter { indexable($0) && $0.contentFingerprint == r.contentFingerprint }.count > 1 },
+            issue("Technical URLs in sitemap", "Warning", "Medium") { $0.inSitemap && isTechnicalSitemapURL($0) },
+            issue("Duplicate content", "Warning", "Medium") { r in indexable(r) && (fingerprintCounts[r.contentFingerprint] ?? 0) > 1 },
             issue("Missing x-default hreflang", "Warning", "Low") { !$0.hreflangCodes.isEmpty && !$0.hasXDefault },
             issue("Hreflang self-reference missing", "Issue", "High") { record in !record.hreflangTargets.isEmpty && !record.hreflangTargets.contains { $0.url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == record.url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) } },
             issue("Duplicate hreflang codes", "Warning", "Medium") { Set($0.hreflangCodes.map { $0.lowercased() }).count < $0.hreflangCodes.count },
@@ -1177,7 +1772,20 @@ enum IssueBuilder {
             }
             ,issue("Backlinks: broken external backlinks", "Issue", "High") { $0.brokenBacklinks > 0 }
             ,issue("Backlinks: high spam score", "Warning", "Medium") { $0.backlinkChecked && $0.backlinkSpamScore >= 50 }
+            ,issue("Page Weight: Heavy Pages", "Warning", "Medium") { $0.isSEOPage && $0.pageWeight > PageMetricsAnalyzer.configuration.weightWarning }
+            ,issue("Page Weight: Abnormally Heavy Pages", "Warning", "High") { $0.isSEOPage && PageMetricsAnalyzer.isAbnormallyHeavy($0, medians: pageWeightMedians) }
+            ,issue("AI: Heavy for AI Parsing", "Warning", "Medium") { $0.isSEOPage && $0.aiParsability == "Heavy for AI Parsing" }
+            ,issue("AI: Very Heavy for AI Parsing", "Issue", "High") { $0.isSEOPage && $0.aiParsability == "Very Heavy for AI Parsing" }
+            ,issue("AI: Excessive DOM Size", "Warning", "Medium") { $0.isSEOPage && $0.domNodeCount >= PageMetricsAnalyzer.configuration.domNodeWarning }
+            ,issue("AI: Low Content-to-HTML Ratio", "Warning", "Medium") { $0.isSEOPage && $0.htmlSize >= PageMetricsAnalyzer.configuration.aiHTMLWarning && $0.contentToHTMLRatio > 0 && $0.contentToHTMLRatio < PageMetricsAnalyzer.configuration.contentRatioWarning }
+            ,issue("AI: Excessive Inline Data", "Warning", "Medium") { $0.isSEOPage && ($0.inlineJavaScriptSize + $0.inlineCSSSize + $0.embeddedJSONSize) >= PageMetricsAnalyzer.configuration.inlineDataWarning }
         ].compactMap { $0 }
+        if let homepage = records.first(where: { $0.isSEOPage && $0.depth == 0 }) {
+            if homepage.pageWeight > PageMetricsAnalyzer.configuration.weightWarning { result.append(Issue(name: "Homepage: Heavy Page", type: "Warning", priority: homepage.pageWeight > PageMetricsAnalyzer.configuration.weightHigh ? "High" : "Medium", urlIDs: [homepage.id])) }
+            if homepage.imageResourceSize > homepage.htmlSize && homepage.imageResourceSize > PageMetricsAnalyzer.configuration.weightWarning { result.append(Issue(name: "Homepage: Heavy Images", type: "Warning", priority: "Medium", urlIDs: [homepage.id])) }
+            if homepage.javascriptResourceSize > PageMetricsAnalyzer.configuration.weightWarning { result.append(Issue(name: "Homepage: Heavy JavaScript", type: "Warning", priority: "Medium", urlIDs: [homepage.id])) }
+            if homepage.aiParsability != "AI Friendly" { result.append(Issue(name: "Homepage: (homepage.aiParsability)", type: "Warning", priority: homepage.aiParsability.hasPrefix("Very") ? "High" : "Medium", urlIDs: [homepage.id])) }
+        }
         if let report = gscSiteReport {
             let priorities: [String: (type: String, priority: String)] = [
                 "404": ("Issue", "High"), "soft404": ("Issue", "High"), "5xx": ("Issue", "High"), "redirect-error": ("Issue", "High"),
@@ -1243,7 +1851,7 @@ enum OverviewBuilder {
             section("Page Titles", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.title.isEmpty }), duplicateRow("Duplicate", { $0.title }), row("Over 60 Characters", indexableHTML, { $0.title.count > 60 }), row("Below 30 Characters", indexableHTML, { !$0.title.isEmpty && $0.title.count < 30 }), row("Over 561 Pixels", indexableHTML, { $0.title.count > 60 }), row("Below 200 Pixels", indexableHTML, { !$0.title.isEmpty && $0.title.count < 20 }), row("Same as H1", indexableHTML, { !$0.title.isEmpty && $0.title == $0.h1 }), row("Multiple", indexableHTML, { _ in false }), row("Outside <head>", indexableHTML, { _ in false })]),
             section("Meta Description", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.metaDescription.isEmpty }), duplicateRow("Duplicate", { $0.metaDescription }), row("Over 155 Characters", indexableHTML, { $0.metaDescription.count > 155 }), row("Below 70 Characters", indexableHTML, { !$0.metaDescription.isEmpty && $0.metaDescription.count < 70 }), row("Over 985 Pixels", indexableHTML, { $0.metaDescription.count > 155 }), row("Below 400 Pixels", indexableHTML, { !$0.metaDescription.isEmpty && $0.metaDescription.count < 70 }), row("Multiple", indexableHTML, { _ in false }), row("Outside <head>", indexableHTML, { _ in false })]),
             section("Meta Keywords", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.metaKeywords.isEmpty }), duplicateRow("Duplicate", { $0.metaKeywords }), row("Multiple", indexableHTML, { _ in false })]),
-            section("H1", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.h1.isEmpty }), duplicateRow("Duplicate", { $0.h1 }), row("Over 70 Characters", indexableHTML, { $0.h1.count > 70 }), row("Multiple", indexableHTML, { $0.h1Count > 1 }), row("Alt Text in H1", indexableHTML, { _ in false }), row("Non-Sequential", indexableHTML, { _ in false })]),
+            section("H1", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.h1Count == 0 }), duplicateRow("Duplicate", { $0.h1 }), row("Over 70 Characters", indexableHTML, { $0.h1.count > 70 }), row("Multiple", indexableHTML, { $0.h1Count > 1 }), row("Alt Text in H1", indexableHTML, { _ in false }), row("Non-Sequential", indexableHTML, { _ in false })]),
             section("H2", indexableHTML, [row("All", indexableHTML), row("Missing", indexableHTML, { $0.h2.isEmpty }), duplicateRow("Duplicate", { $0.h2 }), row("Over 70 Characters", indexableHTML, { $0.h2.count > 70 }), row("Multiple", indexableHTML, { $0.h2Count > 1 }), row("Non-Sequential", indexableHTML, { _ in false })]),
             section("Content", indexableHTML, [row("All", indexableHTML), row("Exact Duplicates", indexableHTML, { _ in false }), row("Near Duplicates", indexableHTML, { _ in false }), row("Low Content Pages", indexableHTML, { $0.wordCount > 0 && $0.wordCount < 200 }), row("Soft 404 Pages", indexableHTML, { _ in false }), row("Spelling Errors", indexableHTML, { _ in false }), row("Grammar Errors", indexableHTML, { _ in false }), row("Readability Difficult", indexableHTML, { _ in false }), row("Readability Very Difficult", indexableHTML, { _ in false }), row("Lorem Ipsum Placeholder", indexableHTML, { _ in false })]),
             section("Images", records, [row("Images on HTML Pages", html, { !$0.images.isEmpty }), row("Image Resources Crawled", records, { $0.isImageResource }), row("Broken Image Resources", records, { $0.isImageCandidate && (!$0.error.isEmpty || ($0.statusCode ?? 0) >= 400) }), row("Heavy Image Resources", records, { $0.isImageResource && ($0.statusCode ?? 0) / 100 == 2 && $0.size > 100_000 }), row("Over 100 KB", html, { $0.images.contains { $0.size > 100_000 } }), row("Missing Alt Text", html, { $0.images.contains { $0.alt.trimmingCharacters(in: .whitespaces).isEmpty } }), row("Missing Alt Attribute", html, { _ in false }), row("Alt Text Over 100 Characters", html, { $0.images.contains { $0.alt.count > 100 } }), row("Background Images", html, { _ in false }), row("Incorrectly Sized Images", html, { _ in false }), row("Missing Size Attributes", html, { $0.images.contains { $0.width.isEmpty || $0.height.isEmpty } })]),
@@ -1259,7 +1867,7 @@ enum OverviewBuilder {
             section("Validation", html, [row("All", html), row("Invalid HTML Elements in Head", html, { _ in false }), row("<body> Element Preceding <html>", html, { _ in false }), row("<head> Not First In <html> Element", html, { _ in false }), row("Missing <head> Tag", html, { _ in false }), row("Multiple <head> Tags", html, { _ in false }), row("Missing <body> Tag", html, { _ in false }), row("Multiple <body> Tags", html, { _ in false }), row("HTML Document Over 15MB", html, { $0.size > 15_000_000 })]),
             section("WordPress", html, [row("All WordPress pages", html, { $0.cmsName == "WordPress" }), row("Technical head links", html, { !$0.wordPressHeadFindings.isEmpty }), row("RSS / comments feed links", html, { $0.wordPressHeadFindings.contains("RSS/Comments feed discovery links") }), row("RSD / XML-RPC link", html, { $0.wordPressHeadFindings.contains("RSD/XML-RPC discovery link") }), row("Shortlink", html, { $0.wordPressHeadFindings.contains("WordPress shortlink") }), row("WordPress version generator", html, { $0.wordPressHeadFindings.contains("WordPress version generator meta") })]),
             section("Link Metrics", records, [row("All", records)])
-            ,section("Page Types", html, ["Homepage", "Service", "Product", "Category", "Article", "Contact", "Doctor", "Search", "Listing", "System", "Unknown"].map { type in row(type, html, { $0.pageType == type }) })
+            ,section("Page Types", html, ["Homepage", "Service", "Product", "Category", "Article", "News", "Case Study", "Location", "Reviews", "Contact", "Doctor", "AI Bust Page", "Search", "Listing", "System", "Unknown"].map { type in row(type, html, { $0.pageType == type }) })
             ,section("Structured Data (JSON-LD)", schemaPages, [row("All pages", schemaPages), row("Pages with JSON-LD", schemaPages, { !$0.schemaTypes.isEmpty }), row("Pages without JSON-LD", schemaPages, { $0.schemaTypes.isEmpty }), row("Organization / Business", schemaPages, { $0.schemaTypes.contains { ["Organization", "LocalBusiness", "Corporation", "ProfessionalService"].contains($0) } }), row("BreadcrumbList", schemaPages, { $0.schemaTypes.contains("BreadcrumbList") }), row("Product", schemaPages, { $0.schemaTypes.contains("Product") }), row("Review", schemaPages, { $0.schemaTypes.contains("Review") || $0.schemaTypes.contains("AggregateRating") }), row("Article / BlogPosting", schemaPages, { $0.schemaTypes.contains("Article") || $0.schemaTypes.contains("BlogPosting") || $0.schemaTypes.contains("NewsArticle") }), row("FAQPage", schemaPages, { $0.schemaTypes.contains("FAQPage") }), row("WebSite", schemaPages, { $0.schemaTypes.contains("WebSite") }), row("WebPage", schemaPages, { $0.schemaTypes.contains("WebPage") }), row("Service", schemaPages, { $0.schemaTypes.contains("Service") }), row("Person", schemaPages, { $0.schemaTypes.contains("Person") }), row("VideoObject", schemaPages, { $0.schemaTypes.contains("VideoObject") }), row("Event", schemaPages, { $0.schemaTypes.contains("Event") }), row("JobPosting", schemaPages, { $0.schemaTypes.contains("JobPosting") })])
             ,section("Schema Intelligence", schemaPages, [row("Primary schema mismatch", schemaPages, { $0.schemaCompatibility == "Mismatch" }), row("Incomplete primary schema", schemaPages, { !$0.primarySchemaType.isEmpty && $0.schemaCompleteness < 0.75 })])
         ]
@@ -1281,6 +1889,45 @@ enum OverviewBuilder {
                 return OverviewItem(name: group, urlIDs: Set(rows.flatMap(\.urlIDs)), denominator: max(1, core.total), children: rows, displayCount: metrics.reduce(0) { $0 + $1.count })
             }
             result.append(OverviewItem(name: "Google Search Console · Mobile Core Web Vitals", urlIDs: Set(groups.flatMap(\.urlIDs)), denominator: max(1, core.total), children: groups, displayCount: core.total))
+        }
+        let metricPages = html.filter { $0.pageWeight > 0 }
+        if !metricPages.isEmpty {
+            let medians = PageMetricsAnalyzer.typeMedians(metricPages)
+            let homepage = metricPages.first(where: { $0.depth == 0 })
+            let heavy = metricPages.filter { $0.pageWeight > PageMetricsAnalyzer.configuration.weightWarning }
+            let abnormal = metricPages.filter { PageMetricsAnalyzer.isAbnormallyHeavy($0, medians: medians) }
+            let pageMetric = { (name: String, value: Int) in OverviewItem(name: name, urlIDs: [], denominator: 1, displayCount: value) }
+            let typeRows = medians.sorted { $0.key < $1.key }.map { pageMetric("\($0.key) median (KB)", $0.value / 1_024) }
+            var weightRows = [
+                pageMetric("Median Page Weight (KB)", PageMetricsAnalyzer.median(metricPages.map(\.pageWeight)) / 1_024),
+                OverviewItem(name: "Heavy Pages", urlIDs: Set(heavy.map(\.id)), denominator: metricPages.count),
+                OverviewItem(name: "Abnormally Heavy Pages", urlIDs: Set(abnormal.map(\.id)), denominator: metricPages.count)
+            ]
+            if let homepage {
+                weightRows.append(contentsOf: [
+                    pageMetric("Homepage weight (KB)", homepage.pageWeight / 1_024),
+                    pageMetric("Homepage HTML (KB)", homepage.htmlSize / 1_024),
+                    pageMetric("Homepage images (KB)", homepage.imageResourceSize / 1_024),
+                    pageMetric("Homepage requests", homepage.resourceRequestCount)
+                ])
+            }
+            result.append(OverviewItem(name: "Page Weight", urlIDs: Set(metricPages.map(\.id)), denominator: metricPages.count, children: weightRows + typeRows))
+            let heavyAI = metricPages.filter { $0.aiParsability == "Heavy for AI Parsing" }
+            let veryHeavyAI = metricPages.filter { $0.aiParsability == "Very Heavy for AI Parsing" }
+            let largeDOM = metricPages.filter { $0.domNodeCount >= PageMetricsAnalyzer.configuration.domNodeWarning }
+            let lowRatio = metricPages.filter { $0.htmlSize >= PageMetricsAnalyzer.configuration.aiHTMLWarning && $0.contentToHTMLRatio > 0 && $0.contentToHTMLRatio < PageMetricsAnalyzer.configuration.contentRatioWarning }
+            let inlineData = metricPages.filter { $0.inlineJavaScriptSize + $0.inlineCSSSize + $0.embeddedJSONSize >= PageMetricsAnalyzer.configuration.inlineDataWarning }
+            result.append(OverviewItem(name: "AI Parsability", urlIDs: Set(metricPages.map(\.id)), denominator: metricPages.count, children: [
+                OverviewItem(name: "AI Friendly", urlIDs: Set(metricPages.filter { $0.aiParsability == "AI Friendly" }.map(\.id)), denominator: metricPages.count),
+                OverviewItem(name: "Heavy for AI Parsing", urlIDs: Set(heavyAI.map(\.id)), denominator: metricPages.count),
+                OverviewItem(name: "Very Heavy for AI Parsing", urlIDs: Set(veryHeavyAI.map(\.id)), denominator: metricPages.count),
+                OverviewItem(name: "Large DOM", urlIDs: Set(largeDOM.map(\.id)), denominator: metricPages.count),
+                OverviewItem(name: "Low Content / HTML Ratio", urlIDs: Set(lowRatio.map(\.id)), denominator: metricPages.count),
+                OverviewItem(name: "Large Inline Data", urlIDs: Set(inlineData.map(\.id)), denominator: metricPages.count),
+                pageMetric("Median HTML (KB)", PageMetricsAnalyzer.median(metricPages.map(\.htmlSize)) / 1_024),
+                pageMetric("Median HTML tokens", PageMetricsAnalyzer.median(metricPages.map(\.estimatedHTMLTokens))),
+                pageMetric("Median DOM nodes", PageMetricsAnalyzer.median(metricPages.map(\.domNodeCount)))
+            ]))
         }
         return result
     }
@@ -1322,7 +1969,7 @@ private extension Collection where Element: Hashable {
 
 enum CSV {
     static func esc(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
-    static func urls(_ records: [CrawlRecord]) -> [String] { ["URL,Status Code,Status,Content Type,Indexability,GSC Indexed,GSC Fetch Error,GSC Indexing Issue,GSC Google Canonical,GSC Last Crawl,GSC Robots,GSC Noindex,GSC Sitemap,GSC Rich Results Errors,GSC Mobile Usability Issues,Title,Title Length,Meta Description,Description Length,H1,H2,Canonical,Word Count,Crawl Depth,Inlinks,Outlinks,Response Time,Size"] + records.map { [esc($0.url.absoluteString), $0.statusText, esc($0.error), esc($0.contentType), esc($0.indexability), esc($0.searchConsoleIndexStatus), esc($0.searchConsoleFetchStatus), esc($0.searchConsoleCoverage), esc($0.searchConsoleGoogleCanonical), esc($0.searchConsoleLastCrawl), esc($0.searchConsoleRobotsStatus), esc($0.searchConsoleNoindexStatus), esc($0.searchConsoleSitemaps.joined(separator: " | ")), esc($0.searchConsoleRichResultErrors.joined(separator: " | ")), esc($0.searchConsoleMobileIssues.joined(separator: " | ")), esc($0.title), "\($0.title.count)", esc($0.metaDescription), "\($0.metaDescription.count)", esc($0.h1), esc($0.h2), esc($0.canonical), "\($0.wordCount)", "\($0.depth)", "\($0.inlinks)", "\($0.internalLinks + $0.externalLinks)", String(format: "%.3f", $0.responseTime), "\($0.size)"].joined(separator: ",") } }
+    static func urls(_ records: [CrawlRecord]) -> [String] { ["URL,Status Code,Status,Content Type,Indexability,Transport,Primary Status,Chrome CDP Status,Chrome Verification,GSC Indexed,GSC Fetch Error,GSC Indexing Issue,GSC Google Canonical,GSC Last Crawl,GSC Robots,GSC Noindex,GSC Sitemap,GSC Rich Results Errors,GSC Mobile Usability Issues,Title,Title Length,Meta Description,Description Length,H1,H2,Canonical,Word Count,Crawl Depth,Inlinks,Outlinks,Response Time,Decoded Response Bytes,Transferred Bytes,Content Encoding,Page Weight,Decoded HTML Size,Images Size,JS Size,CSS Size,Requests,AI Parsability,HTML Tokens,DOM Nodes"] + records.map { [esc($0.url.absoluteString), $0.statusText, esc($0.error), esc($0.contentType), esc($0.indexability), esc($0.transportUsed), $0.originalStatus.map(String.init) ?? "", $0.cdpStatus.map(String.init) ?? "", esc($0.verificationResult), esc($0.searchConsoleIndexStatus), esc($0.searchConsoleFetchStatus), esc($0.searchConsoleCoverage), esc($0.searchConsoleGoogleCanonical), esc($0.searchConsoleLastCrawl), esc($0.searchConsoleRobotsStatus), esc($0.searchConsoleNoindexStatus), esc($0.searchConsoleSitemaps.joined(separator: " | ")), esc($0.searchConsoleRichResultErrors.joined(separator: " | ")), esc($0.searchConsoleMobileIssues.joined(separator: " | ")), esc($0.title), "\($0.title.count)", esc($0.metaDescription), "\($0.metaDescription.count)", esc($0.h1), esc($0.h2), esc($0.canonical), "\($0.wordCount)", "\($0.depth)", "\($0.inlinks)", "\($0.internalLinks + $0.externalLinks)", String(format: "%.3f", $0.responseTime), "\($0.size)", "\($0.transferredSize)", esc($0.contentEncoding), "\($0.pageWeight)", "\($0.htmlSize)", "\($0.imageResourceSize)", "\($0.javascriptResourceSize)", "\($0.cssResourceSize)", "\($0.resourceRequestCount)", esc($0.aiParsability), "\($0.estimatedHTMLTokens)", "\($0.domNodeCount)"].joined(separator: ",") } }
     static func issues(_ issues: [Issue], total: Int) -> [String] { ["Issue Name,Type,Priority,URLs,% of Total"] + issues.map { "\(esc($0.name)),\($0.type),\($0.priority),\($0.count),\(total == 0 ? 0 : Double($0.count) / Double(total) * 100)" } }
     static func overview(_ items: [OverviewItem], total: Int) -> [String] {
         func flatten(_ item: OverviewItem, level: Int) -> [(OverviewItem, Int)] { [(item, level)] + item.children.flatMap { flatten($0, level: level + 1) } }

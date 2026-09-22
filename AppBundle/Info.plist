@@ -5,23 +5,23 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>ShareSpider</string>
+    <string>SEOSpiderAgent</string>
     <key>CFBundleIconFile</key>
     <string>ShareSpider</string>
     <key>CFBundleExecutable</key>
-    <string>ShareSpider</string>
+    <string>SEOSpiderAgent</string>
     <key>CFBundleIdentifier</key>
     <string>com.sharespider.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>ShareSpider</string>
+    <string>SEOSpiderAgent</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+	<string>1.5</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+	<string>18</string>
     <key>CFBundleURLTypes</key>
     <array><dict><key>CFBundleURLName</key><string>ShareSpider scan command</string><key>CFBundleURLSchemes</key><array><string>sharespider</string></array></dict></array>
     <key>LSMinimumSystemVersion</key>

@@ -3,7 +3,8 @@ import SwiftSoup
 
 struct PageAnalysis: Sendable {
     var title = ""; var description = ""; var keywords = ""; var h1 = ""; var h2 = ""; var h1Count = 0; var h2Count = 0; var canonical = ""; var canonicalRaw = ""; var canonicalCount = 0; var robots = ""; var language = ""; var hreflang = ""; var hreflangCodes: [String] = []; var hreflangTargets: [HreflangLink] = []; var hasXDefault = false; var paginationURLs: [String] = []; var contentFingerprint = ""; var schemaTypes: [String] = []; var schemaJSON = ""; var ogType = ""; var hasPrice = false; var hasAddToCart = false; var hasBookingForm = false; var hasAuthor = false; var hasPublishedDate = false; var repeatedCardCount = 0; var hasContactDetails = false
-    var wordCount = 0; var internalLinks: [URL] = []; var internalLinkDetails: [CrawledLink] = []; var externalLinks: [URL] = []; var images: [CrawledImage] = []; var analyticsIDs: [String] = []; var analyticsSignals: [String] = []; var wordPressHeadFindings: [String] = []
+    var wordCount = 0; var currencyAmountCount = 0; var internalLinks: [URL] = []; var internalLinkDetails: [CrawledLink] = []; var externalLinks: [URL] = []; var images: [CrawledImage] = []; var analyticsIDs: [String] = []; var analyticsSignals: [String] = []; var wordPressHeadFindings: [String] = []
+    var rawHTMLSize = 0; var cleanedHTMLSize = 0; var extractedTextSize = 0; var estimatedHTMLTokens = 0; var estimatedTextTokens = 0; var domNodeCount = 0; var inlineJavaScriptSize = 0; var inlineCSSSize = 0; var embeddedJSONSize = 0; var resourceRequestCount = 0; var resourceCandidates: [PageResource] = []
 }
 
 enum HTMLAnalyzer {
@@ -11,6 +12,7 @@ enum HTMLAnalyzer {
         guard let doc = try? SwiftSoup.parse(html, baseURL.absoluteString) else { return PageAnalysis() }
         func text(_ selector: String) -> String { (try? doc.select(selector).first()?.text()) ?? "" }
         var output = PageAnalysis()
+        output.rawHTMLSize = html.lengthOfBytes(using: .utf8)
         output.title = text("head title")
         output.description = (try? doc.select("head meta[name=description]").first()?.attr("content")) ?? ""
         output.ogType = (try? doc.select("meta[property=og:type]").first()?.attr("content")) ?? ""
@@ -39,26 +41,76 @@ enum HTMLAnalyzer {
         }) ?? []
         output.hasXDefault = output.hreflangCodes.contains { $0.lowercased() == "x-default" }
         output.paginationURLs = (try? doc.select("link[rel=next], link[rel=prev]").map { try $0.absUrl("href") }.filter { !$0.isEmpty }) ?? []
-        let pageHTML = html.lowercased(); output.hasPrice = pageHTML.contains("price") || pageHTML.contains("₽") || pageHTML.contains("$"); output.hasAddToCart = pageHTML.contains("add to cart") || pageHTML.contains("в корзин"); output.hasBookingForm = pageHTML.contains("book") || pageHTML.contains("записаться") || pageHTML.contains("appointment"); output.hasAuthor = pageHTML.contains("author") || pageHTML.contains("автор"); output.hasPublishedDate = pageHTML.contains("datepublished") || pageHTML.contains("published_time"); output.hasContactDetails = pageHTML.contains("tel:") || pageHTML.contains("@") && pageHTML.contains("mail")
+        // Case-insensitive range searches are surprisingly expensive on large,
+        // mixed-language catalogue documents: every individual signal scans the
+        // entire string with Unicode case folding. Build one compact working
+        // copy instead and use inexpensive literal lookups for all signals.
+        let signalHTML = html.lowercased()
+        func hasSignal(_ value: String) -> Bool { signalHTML.contains(value) }
+        output.hasPrice = hasSignal("price") || html.contains("₽") || html.contains("$")
+        output.hasAddToCart = hasSignal("add to cart") || hasSignal("в корзин")
+        output.hasBookingForm = hasSignal("book") || hasSignal("записаться") || hasSignal("appointment")
+        output.hasAuthor = hasSignal("author") || hasSignal("автор")
+        output.hasPublishedDate = hasSignal("datepublished") || hasSignal("published_time")
+        output.hasContactDetails = hasSignal("tel:") || (html.contains("@") && hasSignal("mail"))
         output.repeatedCardCount = (try? doc.select("article, .card, .product, .item").count) ?? 0
-        output.h1 = text("body h1")
+        // Use the tag selector rather than a body-descendant selector. Some
+        // otherwise valid HTML documents omit an explicit <body> in source;
+        // SwiftSoup then normalises it differently and the old selector could
+        // falsely report an existing H1 as missing.
+        output.h1 = text("h1")
         output.h2 = text("body h2")
-        output.h1Count = (try? doc.select("body h1").count) ?? 0
+        output.h1Count = (try? doc.select("h1").count) ?? 0
         output.h2Count = (try? doc.select("body h2").count) ?? 0
         let bodyText = (try? doc.body()?.text()) ?? ""
-        output.contentFingerprint = String(bodyText.lowercased().split(whereSeparator: { $0.isWhitespace }).prefix(250).joined(separator: " ").hashValue)
+        // A price list has many independent monetary amounts.  One price is a
+        // common supporting signal on product/service pages, so keep the count
+        // separate for the classifier instead of turning every priced page
+        // into a Price page.
+        let currencyPattern = "\\b\\d{1,3}(?:\\s\\d{3})*(?:[.,]\\d{2})?\\s*(?:₽|руб\\.?|рублей|р\\.)"
+        output.currencyAmountCount = (try? NSRegularExpression(pattern: currencyPattern).numberOfMatches(in: bodyText, range: NSRange(bodyText.startIndex..., in: bodyText))) ?? 0
+        // `cleanedHTMLSize` is retained for backwards-compatible exports. The
+        // expensive regex-created document copy was not consumed by any report;
+        // raw HTML is the meaningful input for the AI parsing assessment.
+        output.cleanedHTMLSize = output.rawHTMLSize
+        output.extractedTextSize = bodyText.lengthOfBytes(using: .utf8)
+        output.estimatedHTMLTokens = max(0, output.rawHTMLSize / 4)
+        output.estimatedTextTokens = max(0, output.extractedTextSize / 4)
+        output.domNodeCount = (try? doc.getAllElements().count) ?? 0
+        output.inlineJavaScriptSize = (try? doc.select("script:not([src])").array().reduce(0) { $0 + ((try? $1.html()) ?? "").lengthOfBytes(using: .utf8) }) ?? 0
+        output.inlineCSSSize = (try? doc.select("style").array().reduce(0) { $0 + ((try? $1.html()) ?? "").lengthOfBytes(using: .utf8) }) ?? 0
+        // Only the opening content is used for duplicate detection. Limit the
+        // split itself, rather than splitting an entire multi-megabyte page.
+        let fingerprintWords = bodyText.split(maxSplits: 250, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+        output.contentFingerprint = String(fingerprintWords.prefix(250).joined(separator: " ").lowercased().hashValue)
         let jsonLD = (try? doc.select("script[type=application/ld+json]").array().compactMap { try $0.html() }.joined(separator: "\n")) ?? ""
         output.schemaJSON = jsonLD
+        output.embeddedJSONSize = jsonLD.lengthOfBytes(using: .utf8)
         let typePattern = "\\\"@type\\\"\\s*:\\s*(?:\\[\\s*)?\\\"([^\\\"]+)\\\""
         if let regex = try? NSRegularExpression(pattern: typePattern) { output.schemaTypes = Array(Set(regex.matches(in: jsonLD, range: NSRange(jsonLD.startIndex..., in: jsonLD)).compactMap { Range($0.range(at: 1), in: jsonLD).map { String(jsonLD[$0]) } })).sorted() }
-        output.wordCount = bodyText.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+        // Count words without allocating an array for every word in the page.
+        var words = 0; var inWord = false
+        for scalar in bodyText.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) { inWord = false }
+            else if !inWord { words += 1; inWord = true }
+        }
+        output.wordCount = words
         // GA4 IDs have a substantial identifier after G-; requiring 6+ characters prevents false positives such as `G-GO` in JavaScript text.
-        let patterns = ["GTM-[A-Z0-9]{6,}", "G-[A-Z0-9]{6,}", "GT-[A-Z0-9]{6,}", "AW-[0-9]{6,}", "UA-[0-9]+-[0-9]+"]
-        output.analyticsIDs = patterns.flatMap { pattern in (try? NSRegularExpression(pattern: pattern).matches(in: html, range: NSRange(html.startIndex..., in: html)).compactMap { Range($0.range, in: html).map { String(html[$0]) } }) ?? [] }
-        if html.localizedCaseInsensitiveContains("googletagmanager.com") { output.analyticsSignals.append("Google Tag Manager") }
-        if html.localizedCaseInsensitiveContains("google-analytics.com") { output.analyticsSignals.append("Google Analytics script") }
-        if html.contains("gtag(") { output.analyticsSignals.append("gtag") }
-        if html.contains("dataLayer") { output.analyticsSignals.append("dataLayer") }
+        let analyticsPatterns: [(prefix: String, expression: String)] = [
+            ("gtm-", "GTM-[A-Z0-9]{6,}"),
+            ("g-", "G-[A-Z0-9]{6,}"),
+            ("gt-", "GT-[A-Z0-9]{6,}"),
+            ("aw-", "AW-[0-9]{6,}"),
+            ("ua-", "UA-[0-9]+-[0-9]+")
+        ]
+        output.analyticsIDs = analyticsPatterns.flatMap { candidate in
+            guard hasSignal(candidate.prefix) else { return [String]() }
+            return (try? NSRegularExpression(pattern: candidate.expression).matches(in: html, range: NSRange(html.startIndex..., in: html)).compactMap { Range($0.range, in: html).map { String(html[$0]) } }) ?? []
+        }
+        if hasSignal("googletagmanager.com") { output.analyticsSignals.append("Google Tag Manager") }
+        if hasSignal("google-analytics.com") { output.analyticsSignals.append("Google Analytics script") }
+        if hasSignal("gtag(") { output.analyticsSignals.append("gtag") }
+        if hasSignal("datalayer") { output.analyticsSignals.append("dataLayer") }
         let anchors = (try? doc.select("a[href]").array()) ?? []
         for a in anchors {
             let rel = (try? a.attr("rel"))?.lowercased() ?? ""
@@ -75,6 +127,24 @@ enum HTMLAnalyzer {
             guard let src = try? node.absUrl("src"), !src.isEmpty else { return nil }
             return CrawledImage(url: src, alt: (try? node.attr("alt")) ?? "", width: (try? node.attr("width")) ?? "", height: (try? node.attr("height")) ?? "")
         }
+        func resource(_ selector: String, kind: String) -> [PageResource] {
+            ((try? doc.select(selector).array()) ?? []).compactMap { node in
+                let value = (try? node.absUrl("src")) ?? ""
+                let href = value.isEmpty ? ((try? node.absUrl("href")) ?? "") : value
+                guard let resourceURL = URL(string: href), !href.isEmpty else { return nil }
+                return PageResource(url: href, kind: kind, thirdParty: !isInternal(resourceURL, rootHost: rootHost, subdomains: settings.crawlSubdomains))
+            }
+        }
+        output.resourceCandidates = output.images.compactMap { image in
+            guard let imageURL = URL(string: image.url) else { return nil }
+            return PageResource(url: image.url, kind: "Images", thirdParty: !isInternal(imageURL, rootHost: rootHost, subdomains: settings.crawlSubdomains))
+        }
+        output.resourceCandidates += resource("script[src]", kind: "JavaScript")
+        output.resourceCandidates += resource("link[rel~=stylesheet]", kind: "CSS")
+        output.resourceCandidates += resource("link[as=font], link[href$=.woff], link[href$=.woff2], link[href$=.ttf], link[href$=.otf]", kind: "Fonts")
+        output.resourceCandidates += resource("link[rel=preload][as=image]", kind: "Images")
+        var seen = Set<String>(); output.resourceCandidates = output.resourceCandidates.filter { seen.insert($0.url).inserted }
+        output.resourceRequestCount = 1 + output.resourceCandidates.count
         return output
     }
 

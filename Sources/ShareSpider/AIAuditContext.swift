@@ -8,6 +8,9 @@ struct AuditContext: Codable, Sendable {
     var pageTypeDistribution: [CountBreakdown]
     var schemaTypesDistribution: [CountBreakdown]
     var schemaCompatibilityDistribution: [CountBreakdown]
+    /// Compact Page Weight and AI Parsability summary. Individual URLs remain
+    /// available to an agent through the ShareSpider MCP tools.
+    var pageMetrics: AIAuditPageMetrics
     var backlinkSummary: AIAuditBacklinkSummary
     var topReferringDomains: [AIAuditReferringDomain]
     var topBacklinkSources: [AIAuditBacklinkSource]
@@ -26,7 +29,7 @@ struct AuditContext: Codable, Sendable {
 
 extension AuditContext {
     @MainActor
-    static func form(siteURL: String, records: [CrawlRecord], overview: [OverviewItem], issues: [Issue], backlinkSummary: AIAuditBacklinkSummary, referringDomainDetails: [ReferringDomainDetail], backlinkSourceDetails: [BacklinkSourceDetail], gscSummary: AIAuditSearchConsoleSummary, gscErrorCategories: [AIAuditSearchConsoleError], backlinkAnalysis: String, technicalAnalysis: String, searchConsoleAnalysis: String, crawlSummary: AIAuditCrawlSummary) -> AuditContext {
+    static func form(siteURL: String, records: [CrawlRecord], overview: [OverviewItem], issues: [Issue], backlinkSummary: AIAuditBacklinkSummary, referringDomainDetails: [ReferringDomainDetail], backlinkSourceDetails: [BacklinkSourceDetail], gscSummary: AIAuditSearchConsoleSummary, gscErrorCategories: [AIAuditSearchConsoleError], pageMetrics: AIAuditPageMetrics, backlinkAnalysis: String, technicalAnalysis: String, searchConsoleAnalysis: String, crawlSummary: AIAuditCrawlSummary) -> AuditContext {
         let pages = records.filter(\.isSEOPage)
         let sources = backlinkSourceDetails.sorted { $0.pageRank == $1.pageRank ? $0.domainRank > $1.domainRank : $0.pageRank > $1.pageRank }.prefix(50).map { source in
             AIAuditBacklinkSource(sourceURL: source.sourceURL, sourceDomain: source.sourceDomain, domainRank: source.domainRank, pageRank: source.pageRank, anchor: source.anchor, dofollow: source.dofollow, spamScore: source.spamScore, donorType: BacklinkClassifier.donorType(for: source).rawValue, anchorType: BacklinkClassifier.anchorType(for: source, target: source.targetURL).rawValue)
@@ -37,6 +40,6 @@ extension AuditContext {
         func counts(_ values: [String]) -> [CountBreakdown] {
             Dictionary(grouping: values, by: { $0 }).map { .init(type: $0.key, count: $0.value.count) }.sorted { $0.count > $1.count }
         }
-        return AuditContext(siteURL: siteURL, crawlSummary: crawlSummary, overview: overview.map { .init(name: $0.name, count: $0.count, denominator: $0.denominator) }, issues: issues.map { .init(name: $0.name, type: $0.type, priority: $0.priority, count: $0.count) }, pageTypeDistribution: counts(pages.map(\.displayPageType)), schemaTypesDistribution: counts(pages.flatMap(\.schemaTypes)), schemaCompatibilityDistribution: counts(pages.map(\.schemaCompatibility)), backlinkSummary: backlinkSummary, topReferringDomains: referringDomainDetails.sorted { $0.rank > $1.rank }.prefix(50).map { .init(domain: $0.domain, rank: $0.rank, backlinks: $0.backlinks, spamScore: $0.spamScore, referringPages: $0.referringPages) }, topBacklinkSources: sources, donorTypeBreakdown: breakdown(sources.map(\.donorType)), anchorTypeBreakdown: breakdown(sources.map(\.anchorType)), gscSummary: gscSummary, gscErrorCategories: gscErrorCategories, backlinkAnalysis: backlinkAnalysis, technicalAnalysis: technicalAnalysis, searchConsoleAnalysis: searchConsoleAnalysis)
+        return AuditContext(siteURL: siteURL, crawlSummary: crawlSummary, overview: overview.map { .init(name: $0.name, count: $0.count, denominator: $0.denominator) }, issues: issues.map { .init(name: $0.name, type: $0.type, priority: $0.priority, count: $0.count) }, pageTypeDistribution: counts(pages.map(\.displayPageType)), schemaTypesDistribution: counts(pages.flatMap(\.schemaTypes)), schemaCompatibilityDistribution: counts(pages.map(\.schemaCompatibility)), pageMetrics: pageMetrics, backlinkSummary: backlinkSummary, topReferringDomains: referringDomainDetails.sorted { $0.rank > $1.rank }.prefix(50).map { .init(domain: $0.domain, rank: $0.rank, backlinks: $0.backlinks, spamScore: $0.spamScore, referringPages: $0.referringPages) }, topBacklinkSources: sources, donorTypeBreakdown: breakdown(sources.map(\.donorType)), anchorTypeBreakdown: breakdown(sources.map(\.anchorType)), gscSummary: gscSummary, gscErrorCategories: gscErrorCategories, backlinkAnalysis: backlinkAnalysis, technicalAnalysis: technicalAnalysis, searchConsoleAnalysis: searchConsoleAnalysis)
     }
 }

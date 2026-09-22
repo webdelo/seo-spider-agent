@@ -265,7 +265,9 @@ private enum SearchConsoleHTTP {
     }
 }
 
-private final class OAuthLoopbackServer: @unchecked Sendable {
+/// Reusable local callback listener for OAuth providers using authorization
+/// code + PKCE. It never persists the received one-time authorization code.
+final class OAuthLoopbackServer: @unchecked Sendable {
     private let listener: NWListener
     private let codeLock = NSLock()
     private var continuation: CheckedContinuation<String, Error>?

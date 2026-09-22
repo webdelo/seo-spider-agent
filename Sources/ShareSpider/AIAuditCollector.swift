@@ -5,10 +5,11 @@ struct AIAuditReferringDomain: Codable, Sendable { var domain: String; var rank:
 struct AIAuditBacklinkSource: Codable, Sendable { var sourceURL: String; var sourceDomain: String; var domainRank: Int; var pageRank: Int; var anchor: String; var dofollow: Bool; var spamScore: Int; var donorType: String; var anchorType: String }
 struct AIAuditTechnicalIssue: Codable, Sendable { var name: String; var type: String; var priority: String; var count: Int; var percentage: Double; var pageTypesAffected: [String]; var examples: [String] }
 struct AIAuditTechnicalFinding: Codable, Sendable { var title: String; var severity: String; var detail: String; var examples: [String] }
+struct AIAuditPageMetrics: Codable, Sendable { var medianWeight: Int; var heavyPages: Int; var abnormalPages: Int; var typeMedians: [AIAuditCountBreakdown]; var aiFriendly: Int; var aiHeavy: Int; var aiVeryHeavy: Int; var medianHTML: Int; var medianTokens: Int; var medianDOM: Int; var largeDOM: Int; var lowContentRatio: Int; var largeInlineData: Int; var examples: [String] }
 struct AIAuditGSCURLDetail: Codable, Sendable { var url: String; var httpStatus: Int?; var indexability: String; var canonical: String; var pageType: String }
 struct AIAuditSearchConsoleError: Codable, Sendable { var type: String; var count: Int; var examples: [String]; var exampleDetails: [AIAuditGSCURLDetail] }
 struct AIAuditBacklinkBlock: Codable, Sendable { var summary: AIAuditBacklinkSummary; var topReferringDomains: [AIAuditReferringDomain]; var topBacklinkSources: [AIAuditBacklinkSource]; var donorTypeBreakdown: [AIAuditCountBreakdown]; var anchorTypeBreakdown: [AIAuditCountBreakdown]; var domainRankDistribution: [AIAuditCountBreakdown]; var pagesWithoutBacklinks: [String] }
-struct AIAuditTechnicalBlock: Codable, Sendable { var crawlSummary: AIAuditCrawlSummary; var issues: [AIAuditTechnicalIssue]; var auditFindings: [AIAuditTechnicalFinding] }
+struct AIAuditTechnicalBlock: Codable, Sendable { var crawlSummary: AIAuditCrawlSummary; var issues: [AIAuditTechnicalIssue]; var auditFindings: [AIAuditTechnicalFinding]; var pageMetrics: AIAuditPageMetrics }
 struct AIAuditSearchConsoleBlock: Codable, Sendable { var summary: AIAuditSearchConsoleSummary; var errors: [AIAuditSearchConsoleError] }
 struct AIAuditReportData: Sendable { var crawlSummary: AIAuditCrawlSummary; var backlinkSummary: AIAuditBacklinkSummary; var searchConsoleSummary: AIAuditSearchConsoleSummary; var backlinkProfile: AIAuditBacklinkBlock; var technicalErrors: AIAuditTechnicalBlock; var searchConsoleErrors: AIAuditSearchConsoleBlock }
 
@@ -18,11 +19,31 @@ enum AIAuditCollector {
         let html = records.filter(\.isSEOPage), indexable = html.filter { $0.indexability == "Indexable" }
         let errors = records.filter { !$0.error.isEmpty || ($0.statusCode ?? 0) >= 400 }, redirects = records.filter { $0.hasRedirect || ($0.statusCode ?? 0) / 100 == 3 }
         let missingAltPages = html.filter { $0.images.contains { $0.alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } }
-        let crawl = AIAuditCrawlSummary(totalURLs: records.count, htmlPages: html.count, errorCount: errors.count, redirectCount: redirects.count, missingTitles: indexable.filter { $0.title.isEmpty }.count, missingDescriptions: indexable.filter { $0.metaDescription.isEmpty }.count, missingH1: indexable.filter { $0.h1.isEmpty }.count, missingCanonical: indexable.filter { $0.canonical.isEmpty }.count, missingAltText: missingAltPages.count, averageResponseTime: records.isEmpty ? 0 : records.reduce(0) { $0 + $1.responseTime } / Double(records.count), pagesWithoutInlinks: html.filter { $0.depth > 0 && $0.inlinks == 0 }.count)
+        let sitemap = auditReport?.sitemap
+        let crawl = AIAuditCrawlSummary(totalURLs: records.count, htmlPages: html.count, errorCount: errors.count, redirectCount: redirects.count, missingTitles: indexable.filter { $0.title.isEmpty }.count, missingDescriptions: indexable.filter { $0.metaDescription.isEmpty }.count, missingH1: indexable.filter { $0.h1Count == 0 }.count, missingCanonical: indexable.filter { $0.canonical.isEmpty }.count, missingAltText: missingAltPages.count, averageResponseTime: records.isEmpty ? 0 : records.reduce(0) { $0 + $1.responseTime } / Double(records.count), pagesWithoutInlinks: html.filter { $0.depth > 0 && $0.inlinks == 0 }.count, sitemapURLs: sitemap?.urls.count ?? 0, sitemapAvailable: !(sitemap?.roots.isEmpty ?? true) && (sitemap?.error.isEmpty ?? false), successfulTitledPages: html.filter { !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count)
 
         let eligible = records.filter(\.isGSCEligible), pagesWithoutBacklinks = eligible.filter { $0.backlinkChecked && $0.backlinks == 0 }
         let domain = backlinkReport?.domain ?? BacklinkDomainProfile()
-        let backlinks = AIAuditBacklinkSummary(domainRank: domain.rank, totalBacklinks: domain.backlinks, referringDomains: domain.referringDomains, dofollowBacklinks: domain.dofollowBacklinks, nofollowBacklinks: domain.nofollowBacklinks, brokenBacklinks: domain.brokenBacklinks, spamScore: domain.spamScore, pagesWithoutBacklinks: pagesWithoutBacklinks.count, totalEligiblePages: eligible.count)
+        // Source analysis is a newer, paginated DataForSEO dataset than the
+        // compact domain summary. When it exists, it is the source of truth
+        // for active/lost state and must not be mixed with an old zero summary.
+        let activeSources = backlinkSourceDetails.filter { !$0.isLost }
+        let backlinks: AIAuditBacklinkSummary
+        if !activeSources.isEmpty {
+            backlinks = AIAuditBacklinkSummary(
+                domainRank: domain.rank,
+                totalBacklinks: activeSources.count,
+                referringDomains: Set(activeSources.map(\.sourceDomain).filter { !$0.isEmpty }).count,
+                dofollowBacklinks: activeSources.filter(\.dofollow).count,
+                nofollowBacklinks: activeSources.filter { !$0.dofollow }.count,
+                brokenBacklinks: activeSources.filter(\.broken).count,
+                spamScore: activeSources.map(\.spamScore).max() ?? 0,
+                pagesWithoutBacklinks: pagesWithoutBacklinks.count,
+                totalEligiblePages: eligible.count
+            )
+        } else {
+            backlinks = AIAuditBacklinkSummary(domainRank: domain.rank, totalBacklinks: domain.backlinks, referringDomains: domain.referringDomains, dofollowBacklinks: domain.dofollowBacklinks, nofollowBacklinks: domain.nofollowBacklinks, brokenBacklinks: domain.brokenBacklinks, spamScore: domain.spamScore, pagesWithoutBacklinks: pagesWithoutBacklinks.count, totalEligiblePages: eligible.count)
+        }
         let rankedSources = backlinkSourceDetails.sorted { $0.pageRank == $1.pageRank ? $0.domainRank > $1.domainRank : $0.pageRank > $1.pageRank }.prefix(50)
         let sources = rankedSources.map { source in AIAuditBacklinkSource(sourceURL: source.sourceURL, sourceDomain: source.sourceDomain, domainRank: source.domainRank, pageRank: source.pageRank, anchor: source.anchor, dofollow: source.dofollow, spamScore: source.spamScore, donorType: BacklinkClassifier.donorType(for: source).rawValue, anchorType: BacklinkClassifier.anchorType(for: source, target: source.targetURL).rawValue) }
         let rankedDomains = referringDomainDetails.sorted { $0.rank > $1.rank }.prefix(50)
@@ -33,7 +54,12 @@ enum AIAuditCollector {
             return AIAuditTechnicalIssue(name: issue.name, type: issue.type, priority: issue.priority, count: issue.count, percentage: records.isEmpty ? 0 : Double(issue.count) / Double(records.count) * 100, pageTypesAffected: Array(Set(affected.map(\.pageType))).sorted(), examples: examples(for: issue, records: records))
         }
         let auditFindings = (auditReport?.findings ?? []).map { finding in AIAuditTechnicalFinding(title: finding.title, severity: finding.severity, detail: finding.detail, examples: records.filter { finding.urlIDs.contains($0.id) }.prefix(10).map { $0.url.absoluteString }) }
-        let technicalBlock = AIAuditTechnicalBlock(crawlSummary: crawl, issues: technicalIssues, auditFindings: auditFindings)
+        let metricPages = html.filter { $0.pageWeight > 0 }
+        let medians = PageMetricsAnalyzer.typeMedians(metricPages)
+        let abnormal = metricPages.filter { PageMetricsAnalyzer.isAbnormallyHeavy($0, medians: medians) }
+        let inlineThreshold = PageMetricsAnalyzer.configuration.inlineDataWarning
+        let metrics = AIAuditPageMetrics(medianWeight: PageMetricsAnalyzer.median(metricPages.map(\.pageWeight)), heavyPages: metricPages.filter { $0.pageWeight > PageMetricsAnalyzer.configuration.weightWarning }.count, abnormalPages: abnormal.count, typeMedians: medians.map { .init(type: $0.key, count: $0.value) }.sorted { $0.type < $1.type }, aiFriendly: metricPages.filter { $0.aiParsability == "AI Friendly" }.count, aiHeavy: metricPages.filter { $0.aiParsability == "Heavy for AI Parsing" }.count, aiVeryHeavy: metricPages.filter { $0.aiParsability == "Very Heavy for AI Parsing" }.count, medianHTML: PageMetricsAnalyzer.median(metricPages.map(\.htmlSize)), medianTokens: PageMetricsAnalyzer.median(metricPages.map(\.estimatedHTMLTokens)), medianDOM: PageMetricsAnalyzer.median(metricPages.map(\.domNodeCount)), largeDOM: metricPages.filter { $0.domNodeCount >= PageMetricsAnalyzer.configuration.domNodeWarning }.count, lowContentRatio: metricPages.filter { $0.htmlSize > 40_000 && $0.contentToHTMLRatio > 0 && $0.contentToHTMLRatio < PageMetricsAnalyzer.configuration.contentRatioWarning }.count, largeInlineData: metricPages.filter { $0.inlineJavaScriptSize + $0.inlineCSSSize + $0.embeddedJSONSize >= inlineThreshold }.count, examples: abnormal.sorted { $0.pageWeight > $1.pageWeight }.prefix(10).map { "\($0.url.absoluteString) · \($0.pageWeight) bytes · \($0.primaryWeightCause)" })
+        let technicalBlock = AIAuditTechnicalBlock(crawlSummary: crawl, issues: technicalIssues, auditFindings: auditFindings, pageMetrics: metrics)
 
         let inspected = records.filter { $0.searchConsoleIndexStatus != "Not checked" && $0.searchConsoleIndexStatus != "Unavailable" }, unavailable = records.first { $0.searchConsoleIndexStatus == "Unavailable" }
         let gsc = AIAuditSearchConsoleSummary(indexedPages: inspected.filter { $0.searchConsoleIndexStatus == "Indexed" }.count, notIndexedPages: inspected.filter { $0.searchConsoleIndexStatus == "Not indexed" }.count, clicks7d: records.filter(\.searchConsolePerformanceChecked).reduce(0) { $0 + $1.searchConsoleClicks7d }, impressions7d: records.filter(\.searchConsolePerformanceChecked).reduce(0) { $0 + $1.searchConsoleImpressions7d }, coverageErrors: inspected.filter { !$0.searchConsoleCoverage.isEmpty || isFetchError($0.searchConsoleFetchStatus) }.count, mobileUsabilityIssues: inspected.filter { !$0.searchConsoleMobileIssues.isEmpty }.count, available: !inspected.isEmpty || records.contains(where: \.searchConsolePerformanceChecked), unavailableReason: unavailable?.searchConsoleFetchStatus ?? (inspected.isEmpty ? "Search Console data has not been fetched." : ""))

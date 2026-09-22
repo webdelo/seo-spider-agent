@@ -72,6 +72,16 @@ enum GSCSiteReportImport {
         for (key, label) in standard where collected[key] == nil {
             collected[key] = .init(key: key, label: label, count: 0)
         }
+        // "Not Indexed" is GSC's headline total rather than a drill-down
+        // category of its own. Make the Overview row useful by exposing the
+        // deduplicated URLs collected from its exclusion categories.
+        if var notIndexed = collected["not-indexed"] {
+            let details = collected
+                .filter { key, _ in key != "indexed" && key != "not-indexed" }
+                .flatMap { $0.value.examples }
+            notIndexed.examples = Array(Set(details)).sorted()
+            collected["not-indexed"] = notIndexed
+        }
         let report = GSCSiteReport(target: target, metrics: collected.values.sorted { $0.label < $1.label })
         save(report); return report
     }

@@ -8,7 +8,7 @@ struct CMSDetection { var name: String = "Unknown"; var confidence: Double = 0; 
 /// adding another conditional branch to the crawler.
 enum CMSDetector {
     private static let definitions: [CMSRuleSet] = {
-        guard let url = Bundle.module.url(forResource: "cms-detection-rules", withExtension: "json"),
+        guard let url = AppResources.url(forResource: "cms-detection-rules", withExtension: "json"),
               let data = try? Data(contentsOf: url),
               let value = try? JSONDecoder().decode([CMSRuleSet].self, from: data) else { return [] }
         return value

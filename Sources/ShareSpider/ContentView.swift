@@ -695,6 +695,11 @@ private struct AffectedCrawlRecordList: View {
 private struct BacklinkDrilldownList: View {
     @ObservedObject var model: CrawlViewModel
     let kind: BacklinkDrilldownKind
+    /// DataForSEO can return a very large backlink profile.  Rendering every
+    /// row in one SwiftUI lazy stack eventually exhausts AttributeGraph on
+    /// macOS, even when most rows are off-screen. Keep this drilldown compact;
+    /// the full dataset remains available in Backlinks and exports.
+    private let displayLimit = 250
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if model.backlinkDrilldownRunning { ProgressView("Loading (kind.title.lowercased()) from DataForSEO…") }
@@ -703,14 +708,14 @@ private struct BacklinkDrilldownList: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if kind == .referringDomains {
-                        ForEach(model.referringDomainDetails) { item in
+                        ForEach(model.referringDomainDetails.prefix(displayLimit)) { item in
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack { Text(item.domain).font(.body.weight(.semibold)); Spacer(); Text("Rank (item.rank)").monospacedDigit(); Text("Spam (item.spamScore)").monospacedDigit().foregroundStyle(item.spamScore >= 50 ? .red : .secondary) }
                                 Text("\(item.backlinks) backlinks · \(item.referringPages) referring pages · first seen \(item.firstSeen)").font(.caption).foregroundStyle(.secondary)
                             }.padding(.vertical, 7); Divider()
                         }
                     } else {
-                        ForEach(model.backlinkSourceDetails) { item in
+                        ForEach(model.backlinkSourceDetails.prefix(displayLimit)) { item in
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack { Text(item.sourceDomain.isEmpty ? item.sourceURL : item.sourceDomain).font(.body.weight(.semibold)).lineLimit(1); Spacer(); Text("Domain Rank (item.domainRank)").monospacedDigit() }
                                 HStack { Text(item.sourceURL).font(.caption).lineLimit(1); if let url = URL(string: item.sourceURL) { URLActions(url: url) } }
@@ -720,6 +725,11 @@ private struct BacklinkDrilldownList: View {
                         }
                     }
                 }
+            }
+            if kind == .backlinks && model.backlinkSourceDetails.count > displayLimit {
+                Text("Showing the first \(displayLimit) of \(model.backlinkSourceDetails.count) backlinks. Open Backlinks to browse them in pages.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if !model.backlinkMessage.isEmpty { Text(model.backlinkMessage).font(.caption).foregroundStyle(.secondary) }
         }
@@ -935,6 +945,12 @@ struct BacklinksView: View {
     @State private var anchorFilter = "All anchors"
     @State private var linkFilter = "All links"
     @State private var statusFilter = "Active"
+    @State private var sourcePage = 0
+
+    /// Large link profiles are stored in full, but only one page is handed to
+    /// SwiftUI at a time.  This avoids the AttributeGraph memory crash caused
+    /// by a single LazyVStack receiving tens of thousands of dynamic children.
+    private let sourcePageSize = 250
 
     private var crawlIsActive: Bool { model.state == .crawling || model.state == .paused }
 
@@ -985,6 +1001,12 @@ struct BacklinksView: View {
             }
             return donorMatches && anchorMatches && linkMatches
         }
+    }
+    private var sourcePageCount: Int { max(1, Int(ceil(Double(sources.count) / Double(sourcePageSize)))) }
+    private var clampedSourcePage: Int { min(max(0, sourcePage), sourcePageCount - 1) }
+    private var visibleSources: [BacklinkSourceDetail] {
+        let start = clampedSourcePage * sourcePageSize
+        return Array(sources.dropFirst(start).prefix(sourcePageSize))
     }
 
     private var donorCounts: [(String, Int)] {
@@ -1175,11 +1197,22 @@ struct BacklinksView: View {
                     }.labelsHidden().frame(width: 150)
                 }
             }
-            Text("\(sources.count) \(statusFilter.lowercased()) source link\(sources.count == 1 ? "" : "s") shown · donor labels use DataForSEO facts plus editable JSON rules.")
+            HStack(spacing: 8) {
+                Text("\(sources.count) \(statusFilter.lowercased()) source link\(sources.count == 1 ? "" : "s") · donor labels use editable JSON rules.")
+                Spacer()
+                if sources.count > sourcePageSize {
+                    Button("Previous") { sourcePage = max(0, clampedSourcePage - 1) }
+                        .disabled(clampedSourcePage == 0)
+                    Text("\(clampedSourcePage + 1) / \(sourcePageCount)")
+                        .monospacedDigit()
+                    Button("Next") { sourcePage = min(sourcePageCount - 1, clampedSourcePage + 1) }
+                        .disabled(clampedSourcePage + 1 >= sourcePageCount)
+                }
+            }
                 .font(.caption).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(sources) { item in BacklinkSourceRow(item: item, site: model.startText) }
+                    ForEach(visibleSources) { item in BacklinkSourceRow(item: item, site: model.startText) }
                 }
             }
         }
@@ -1218,7 +1251,7 @@ private struct DomainOverlapPanel: View {
                         ForEach(segments.filter { !$0.domains.isEmpty }) { item in
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("\(item.label) · \(item.domains.count)").font(.caption.weight(.semibold))
-                                Text(item.domains.joined(separator: ", "))
+                                Text(domainPreview(item.domains))
                                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                             }
                             Divider()
@@ -1229,6 +1262,12 @@ private struct DomainOverlapPanel: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private func domainPreview(_ domains: [String]) -> String {
+        let limit = 100
+        let shown = domains.prefix(limit).joined(separator: ", ")
+        return domains.count > limit ? "\(shown) … (showing \(limit) of \(domains.count))" : shown
     }
 }
 

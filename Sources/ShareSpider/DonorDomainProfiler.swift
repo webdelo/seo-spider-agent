@@ -25,6 +25,12 @@ enum DonorDomainProfiler {
 
         let limiter = DonorProfileLimiter(limit: 4)
         var signals: [Signal] = []
+        // A domain-only provider can contain thousands of rows. Publishing a
+        // SwiftUI update for every completed homepage check makes the
+        // Backlinks view repeatedly rebuild its charts and comparison table.
+        // Keep feedback smooth without turning progress reporting into the
+        // dominant workload (about 20 updates for a complete profile).
+        let progressStep = max(1, Int(ceil(Double(domains.count) / 20.0)))
         await withTaskGroup(of: Signal.self) { group in
             for domain in domains {
                 group.addTask {
@@ -38,7 +44,9 @@ enum DonorDomainProfiler {
             for await signal in group {
                 signals.append(signal)
                 completed += 1
-                await onProgress(completed, domains.count)
+                if completed == domains.count || completed % progressStep == 0 {
+                    await onProgress(completed, domains.count)
+                }
             }
         }
 
@@ -105,16 +113,30 @@ enum DonorDomainProfiler {
 private actor DonorProfileLimiter {
     private let limit: Int
     private var active = 0
+    private var waiting: [CheckedContinuation<Void, Never>] = []
     init(limit: Int) { self.limit = max(1, limit) }
 
     func acquire() async {
-        while active >= limit {
-            try? await Task.sleep(for: .milliseconds(50))
+        if active < limit {
+            active += 1
+            return
         }
-        active += 1
+        // Suspending is essential here. The previous 50 ms polling loop woke
+        // every queued domain over and over (hundreds of actor turns per
+        // second) while only four network checks could make progress.
+        await withCheckedContinuation { continuation in
+            waiting.append(continuation)
+        }
     }
 
     func release() {
+        if !waiting.isEmpty {
+            let next = waiting.removeFirst()
+            // Hand the just-freed slot directly to the next waiter; `active`
+            // remains unchanged because the number of active workers does.
+            next.resume()
+            return
+        }
         active = max(0, active - 1)
     }
 }

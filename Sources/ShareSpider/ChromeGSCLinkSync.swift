@@ -19,6 +19,27 @@ private final class ProfilePIDOutput: @unchecked Sendable {
     }
 }
 
+/// Process termination and the hard deadline arrive on different queues. This
+/// tiny gate makes exactly one of them complete the UI operation.
+private final class LinkExportCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return false }
+        finished = true
+        return true
+    }
+
+    func isFinished() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+}
+
 /// Runs the locally packaged Playwright helper against a dedicated Chrome
 /// profile.  This is deliberately separate from the Search Console API: the
 /// public API has no endpoint for the Links report.  The helper exports a CSV
@@ -30,6 +51,10 @@ final class ChromeGSCLinkSync {
     /// A Process must outlive `launchFreshChrome`. Retaining it also lets us
     /// record Chrome's eventual exit status and diagnostic streams.
     private var chromeLaunchProcess: Process?
+    /// The Node helper is retained so a closed Chrome window or a stalled GSC
+    /// page can be stopped promptly instead of remaining tied to unrelated
+    /// donor classification work.
+    private var linkExportProcess: Process?
     /// Keep short-lived `kill` children alive until their termination handlers
     /// have recorded the result.  None of these processes is waited on from
     /// the main actor.
@@ -321,13 +346,35 @@ final class ChromeGSCLinkSync {
         process.standardOutput = outputPipe; process.standardError = errorPipe
         ChromeLaunchLogger.capture(outputPipe.fileHandleForReading, label: "Links helper stdout")
         ChromeLaunchLogger.capture(errorPipe.fileHandleForReading, label: "Links helper stderr")
+        let completionGate = LinkExportCompletionGate()
+        var deadlineWorkItem: DispatchWorkItem?
+        func finish(_ result: Result<String, Error>) {
+            guard completionGate.claim() else { return }
+            deadlineWorkItem?.cancel()
+            if self.linkExportProcess === process { self.linkExportProcess = nil }
+            completion(result)
+        }
         do {
             try process.run()
+            linkExportProcess = process
             ChromeLaunchLogger.write("Links runHelper Process.run() returned pid=\(process.processIdentifier)")
         } catch {
             ChromeLaunchLogger.write("Links runHelper Process.run() error=\(error.localizedDescription)")
             completion(.failure(error)); return
         }
+        // A Links export must never sit behind a long donor classification.
+        // The helper has its own short element waits; this is a hard ceiling
+        // for the whole attempt, including a GSC page that stops responding.
+        let deadline = DispatchWorkItem { [weak process] in
+            guard let process, process.isRunning else { return }
+            ChromeLaunchLogger.write("Links helper timed out after 35 seconds; terminating pid=\(process.processIdentifier)")
+            process.terminate()
+            guard completionGate.claim() else { return }
+            if self.linkExportProcess === process { self.linkExportProcess = nil }
+            completion(.failure(SyncError.exportTimedOut))
+        }
+        deadlineWorkItem = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + 35, execute: deadline)
         process.terminationHandler = { [weak self] finished in
             let errorText = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             ChromeLaunchLogger.write("Links helper terminationStatus=\(finished.terminationStatus); stderrRemaining=\(errorText)")
@@ -335,23 +382,33 @@ final class ChromeGSCLinkSync {
             errorPipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
                 guard let self else { return }
+                guard !completionGate.isFinished() else { return }
                 guard finished.terminationStatus == 0,
                       let csv = try? String(contentsOf: self.exportURL, encoding: .utf8),
                       !csv.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     let status = self.status
                     if self.isAccessDenied(status: status, errorText: errorText) {
+                        guard completionGate.claim() else { return }
+                        if self.linkExportProcess === finished { self.linkExportProcess = nil }
                         completion(.failure(SyncError.accessDenied))
                         return
                     }
-                    if self.requiresSignIn(status: status), signInAttempts < 40 {
+                    if self.requiresSignIn(status: status), signInAttempts < 10 {
                         progress("Waiting for Google sign-in in Chrome", 1, 3)
                         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.runHelper(helper: helper, target: target, progress: progress, completion: completion, signInAttempts: signInAttempts + 1) }
                         return
                     }
-                    completion(.failure(SyncError.exportFailed(errorText.isEmpty ? status.message : errorText)))
+                    let failure = self.requiresSignIn(status: status)
+                        ? SyncError.exportFailed("Google sign-in was not completed within 30 seconds — stopped.")
+                        : SyncError.exportFailed(errorText.isEmpty ? status.message : errorText)
+                    guard completionGate.claim() else { return }
+                    if self.linkExportProcess === finished { self.linkExportProcess = nil }
+                    completion(.failure(failure))
                     return
                 }
                 progress("GSC Links CSV received and imported", 3, 3)
+                guard completionGate.claim() else { return }
+                if self.linkExportProcess === finished { self.linkExportProcess = nil }
                 completion(.success(csv))
             }
         }
@@ -383,12 +440,13 @@ final class ChromeGSCLinkSync {
     }
 
     enum SyncError: LocalizedError {
-        case helperUnavailable
+        case helperUnavailable, exportTimedOut
         case accessDenied
         case exportFailed(String)
         var errorDescription: String? {
             switch self {
             case .helperUnavailable: return "The local Chrome export helper is unavailable."
+            case .exportTimedOut: return "Google Search Console Links did not respond within 35 seconds — stopped."
             case .accessDenied: return "No access to this Search Console property — stopped."
             case .exportFailed(let message): return message
             }

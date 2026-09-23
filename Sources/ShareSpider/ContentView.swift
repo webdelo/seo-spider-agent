@@ -1805,6 +1805,12 @@ private struct ReferringDomainSourceTable: View {
     }
 
     private func donorType(for domain: String) -> String {
+        // Ahrefs/Ubersuggest send domain-level spam flags. Treat those as the
+        // same Spam entity as DataForSEO's score and give the explicit provider
+        // signal precedence over page-title/URL/list heuristics.
+        if normalizedAhrefsSpamDomains.contains(domain) || normalizedUbersuggestSpamDomains.contains(domain) {
+            return BacklinkClassifier.DonorType.spam.rawValue
+        }
         if let known = dataForSEOTypes[domain] { return known }
         let priority: [BacklinkClassifier.DonorType] = [.spam, .pbn, .web20, .catalog, .profile, .crowd, .article, .homepage, .redirect, .internationalNetwork, .unknown]
         let types = Set(detailsByDomain[domain, default: []].map { BacklinkClassifier.donorType(for: $0) })
@@ -2136,9 +2142,17 @@ struct AuditView: View {
     @State private var customAIQuestion = ""
     @State private var importedPositionsFile: ImportedPositionsFile?
     var body: some View {
-        AnyView(auditContent)
-            .textSelection(.enabled)
-            .background(Color.white)
+        ZStack {
+            Color.white
+            AnyView(auditContent)
+        }
+        // Audit intentionally uses the premium light presentation requested
+        // for reports. Pin both the background and semantic text colours to the
+        // light scheme so a system-wide dark appearance cannot produce white
+        // text on this white canvas.
+        .environment(\.colorScheme, .light)
+        .foregroundStyle(Color.black)
+        .textSelection(.enabled)
     }
 
     private var auditContent: some View {

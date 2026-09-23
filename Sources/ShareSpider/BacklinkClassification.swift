@@ -118,9 +118,13 @@ enum BacklinkClassifier {
 
     static func donorType(for item: BacklinkSourceDetail) -> DonorType {
         let source = normalized(item.sourceURL + " " + item.sourceTitle + " " + item.sourceDomain)
+        // A provider's explicit spam signal is authoritative for donor
+        // classification. Heuristics are only a fallback when the provider did
+        // not mark the record as spam.
+        if item.spamScore >= 50 { return .spam }
         if item.relatedDomainZone && item.hreflangLinksToTarget { return .internationalNetwork }
         if item.broken || item.sourceStatusCode >= 300 { return .redirect }
-        if item.spamScore >= 50 || matches(source, rules["spam"] ?? []) { return .spam }
+        if matches(source, rules["spam"] ?? []) { return .spam }
         if matches(source, rules["pbn"] ?? []) { return .pbn }
         if matches(source, rules["web20"] ?? []) { return .web20 }
         if isHomepage(item.sourceURL) { return .homepage }

@@ -17,9 +17,26 @@ enum HTMLAnalyzer {
         output.description = (try? doc.select("head meta[name=description]").first()?.attr("content")) ?? ""
         output.ogType = (try? doc.select("meta[property=og:type]").first()?.attr("content")) ?? ""
         output.keywords = (try? doc.select("head meta[name=keywords]").first()?.attr("content")) ?? ""
-        output.canonical = (try? doc.select("head link[rel=canonical]").first()?.absUrl("href")) ?? ""
-        output.canonicalRaw = (try? doc.select("head link[rel=canonical]").first()?.attr("href")) ?? ""
-        output.canonicalCount = (try? doc.select("head link[rel=canonical]").count) ?? 0
+        // Some WordPress themes and optimisation plugins emit a malformed
+        // `<head>` around noscript/inline-script blocks. SwiftSoup then moves
+        // a valid canonical link outside the parsed `head`, so a head-only
+        // selector creates a dangerous false “Missing canonical” finding.
+        let canonicalLinks: [Element]
+        if let allLinks = try? doc.select("link") {
+            canonicalLinks = allLinks.filter { link in
+                let rel = ((try? link.attr("rel")) ?? "").lowercased()
+                return rel.split(whereSeparator: { $0.isWhitespace }).contains("canonical")
+            }
+        } else {
+            canonicalLinks = []
+        }
+        let canonicalLink = canonicalLinks.first
+        output.canonicalRaw = (try? canonicalLink?.attr("href")) ?? ""
+        let absoluteCanonical = (try? canonicalLink?.absUrl("href")) ?? ""
+        output.canonical = !absoluteCanonical.isEmpty
+            ? absoluteCanonical
+            : URL(string: output.canonicalRaw, relativeTo: baseURL)?.absoluteURL.absoluteString ?? ""
+        output.canonicalCount = canonicalLinks.count
         // These tags are injected by WordPress core or plugins. They are useful
         // during development, but normally expose avoidable feed/XML-RPC and
         // shortlink endpoints on a public production site.

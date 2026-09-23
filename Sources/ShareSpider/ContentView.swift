@@ -1942,9 +1942,9 @@ struct AuditView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 auditHeader
+                if model.auditReport != nil { aiAuditContextControls }
                 aiAuditResults
                 if let report = model.auditReport {
-                    aiAuditContextControls
                     GroupBox("Domain profile") {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Primary server IP: \(report.siteProfile.ipAddresses.first ?? "could not be resolved")")

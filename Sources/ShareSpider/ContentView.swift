@@ -656,7 +656,7 @@ struct AffectedURLsView: View {
                         description: Text("Google supplied the category total but did not provide individual URLs in this report. The existing crawl data is not replaced.")
                     )
                 } else {
-                    AffectedCrawlRecordList(records: records, metric: metric, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-URLs", site: model.startText)
+                    AffectedCrawlRecordList(records: records, allRecords: model.records, metric: metric, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-URLs", site: model.startText)
                     Button("Open filtered table in URLs") { showURLs() }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
@@ -719,6 +719,7 @@ private struct AffectedImageList: View {
 /// shows only pages attached to that metric, never the rest of the audit.
 private struct AffectedCrawlRecordList: View {
     let records: [CrawlRecord]
+    let allRecords: [CrawlRecord]
     let metric: String
     let exportName: String
     let site: String
@@ -741,8 +742,29 @@ private struct AffectedCrawlRecordList: View {
         return ["response", "error", "redirect", "redirection", "external", "broken image", "heavy image", "mixed content", "resource"].contains(where: name.contains)
     }
 
+    private var isRedirectMetric: Bool {
+        let name = metric.lowercased()
+        return name.contains("redirect") || name.contains("redirection")
+    }
+
+    private var isWordPressTechnicalHeadMetric: Bool {
+        metric.localizedCaseInsensitiveContains("technical head")
+    }
+
     private func sourcePages(for record: CrawlRecord) -> [URL] {
-        Array(Set(record.foundOnURLs.filter { $0 != record.url }))
+        let candidates = Set(record.foundOnURLs.filter { $0 != record.url })
+        guard isRedirectMetric, !record.redirectSources.isEmpty else {
+            return candidates.sorted { $0.absoluteString < $1.absoluteString }
+        }
+
+        // A final URL can also be linked correctly elsewhere. For a redirect
+        // finding, disclose only pages whose parsed href is the redirecting
+        // address, never every page that links to the final destination.
+        let redirectedAddresses = Set(record.redirectSources.map(\.absoluteString))
+        return allRecords
+            .filter { candidates.contains($0.url) }
+            .filter { page in page.outgoingLinks.contains { redirectedAddresses.contains($0.url) } }
+            .map(\.url)
             .sorted { $0.absoluteString < $1.absoluteString }
     }
 
@@ -773,6 +795,22 @@ private struct AffectedCrawlRecordList: View {
                                 }
                                 .buttonStyle(.plain)
                                 .help(expandedSources.contains(record.id) ? "Hide pages where this URL is used" : "Show pages where this URL is used")
+                            }
+                        }
+                        if isRedirectMetric, let source = record.redirectSources.first {
+                            Text("Redirected URL: \(source.absoluteString) → \(record.url.absoluteString)")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .lineLimit(2)
+                                .textSelection(.enabled)
+                        }
+                        if isWordPressTechnicalHeadMetric {
+                            ForEach(record.wordPressHeadFindings, id: \.self) { finding in
+                                Text(finding)
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(3)
+                                    .textSelection(.enabled)
                             }
                         }
                         if showsReferenceSources && expandedSources.contains(record.id) {
@@ -957,6 +995,7 @@ struct ProblemExampleList: View {
     private var isEmbeddedImageProblem: Bool { isImageAltProblem || problemName == "Images over 100 KB" || problemName == "Over 100 KB" }
     private var isImageResourceProblem: Bool { problemName == "Broken image resources" || problemName == "Heavy image resources" || problemName == "Broken Image Resources" || problemName == "Heavy Image Resources" }
     private var isRedirectProblem: Bool { problemName.localizedCaseInsensitiveContains("redirect") }
+    private var isWordPressTechnicalHeadProblem: Bool { problemName.localizedCaseInsensitiveContains("technical head") }
     private var isPageMetricsProblem: Bool { problemName.localizedCaseInsensitiveContains("page weight") || problemName.localizedCaseInsensitiveContains("ai:") }
     private var isSchemaProblem: Bool { problemName.localizedCaseInsensitiveContains("schema") || problemName.localizedCaseInsensitiveContains("structured data") || ["Organization / Business", "BreadcrumbList", "Product", "Review", "FAQPage", "WebSite", "WebPage", "Service", "Person", "VideoObject", "Event", "JobPosting"].contains(problemName) }
     var body: some View {
@@ -976,7 +1015,7 @@ struct ProblemExampleList: View {
                             Text(record.url.absoluteString).lineLimit(2).textSelection(.enabled)
                             Spacer()
                             URLActions(url: record.url)
-                            if !record.foundOnURLs.isEmpty {
+                            if !isWordPressTechnicalHeadProblem && !record.foundOnURLs.isEmpty {
                                 Button {
                                     if expandedFoundOn.contains(record.id) { expandedFoundOn.remove(record.id) }
                                     else { expandedFoundOn.insert(record.id) }
@@ -988,12 +1027,13 @@ struct ProblemExampleList: View {
                             }
                         }
                         if isSchemaProblem { Text(record.schemaTypes.isEmpty ? "JSON-LD schema not found" : "JSON-LD: \(record.schemaTypes.joined(separator: ", "))").lineLimit(3).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                        else if isWordPressTechnicalHeadProblem { Text(record.wordPressHeadFindings.joined(separator: " · ")).lineLimit(4).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
                         else if isRedirectProblem, let source = record.redirectSources.first { Text("Redirect: \(source.absoluteString) → \(record.url.absoluteString)").lineLimit(3).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
                         else if isTitleProblem { Text(record.title.isEmpty ? "Title is missing" : record.title).lineLimit(3).textSelection(.enabled); Text("Title length: \(record.title.count) characters").font(.caption).foregroundStyle(.secondary) }
                         else if isImageResourceProblem { HStack(spacing: 8) { Text(record.statusText); Text(record.transportLabel); Text(record.contentType); if record.size > 0 { Text(ByteCountFormatter.string(fromByteCount: Int64(record.size), countStyle: .file)) } }.font(.caption).foregroundStyle(record.statusCode.map { $0 >= 400 } == true ? .red : .secondary) }
                         else if isPageMetricsProblem { PageMetricsCompactLine(record: record) }
                         else { HStack(spacing: 8) { Text(record.statusText); Text(record.transportLabel).foregroundStyle(record.transportUsed == "cdp" ? .blue : .secondary); if !record.title.isEmpty { Text(record.title).lineLimit(1) } }.font(.caption).foregroundStyle(.secondary) }
-                        if !isPageMetricsProblem && expandedFoundOn.contains(record.id) { FoundOnLinks(urls: record.foundOnURLs) }
+                        if !isPageMetricsProblem && !isWordPressTechnicalHeadProblem && expandedFoundOn.contains(record.id) { FoundOnLinks(urls: record.foundOnURLs) }
                     }.contextMenu { Button("Open in browser") { NSWorkspace.shared.open(record.url) }; Button("Copy URL") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(record.url.absoluteString, forType: .string) } }
                 }
             }

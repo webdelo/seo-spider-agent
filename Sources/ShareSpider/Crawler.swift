@@ -591,10 +591,15 @@ final class SpiderCrawler: @unchecked Sendable {
                     return (key, String(describing: value))
                 })
                 if let finalURL = response.url, finalURL != url {
-                    result.redirectSources = [url]
-                    result.redirectURL = finalURL
-                    result.redirectChain = [url] + observer.chain
                     result.url = finalURL
+                    // `https://example.com` → `https://example.com/` is just
+                    // a crawl-seed spelling normalisation, not an HTML link an
+                    // editor needs to replace.
+                    if !Self.isBareRootNormalisation(from: url, to: finalURL) {
+                        result.redirectSources = [url]
+                        result.redirectURL = finalURL
+                        result.redirectChain = [url] + observer.chain
+                    }
                 }
                 for header in ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options"] { if let value = http.value(forHTTPHeaderField: header) { result.securityHeaders[header] = value } }
             }
@@ -636,6 +641,17 @@ final class SpiderCrawler: @unchecked Sendable {
         } catch { result.responseTime = Date().timeIntervalSince(start); result.error = error.localizedDescription }
         return result
     }
+    private static func isBareRootNormalisation(from source: URL, to destination: URL) -> Bool {
+        guard var lhs = URLComponents(url: source, resolvingAgainstBaseURL: false),
+              var rhs = URLComponents(url: destination, resolvingAgainstBaseURL: false),
+              lhs.path.isEmpty, rhs.path == "/", lhs.query == rhs.query else { return false }
+        lhs.path = "/"
+        rhs.path = "/"
+        lhs.fragment = nil
+        rhs.fragment = nil
+        return lhs == rhs
+    }
+
     private static func needsChromeVerification(_ record: CrawlRecord) -> Bool {
         let status = record.statusCode ?? 0
         return [403, 429].contains(status) || (500...599).contains(status) || record.suspectedWAF || !record.error.isEmpty
@@ -675,10 +691,12 @@ final class SpiderCrawler: @unchecked Sendable {
         result.size = check.contentLength; result.transportUsed = "cdp"
         result.contentType = check.contentType.isEmpty ? "Unknown" : check.contentType
         if let finalURL = URL(string: check.finalURL), finalURL != url {
-            result.redirectSources = [url]
-            result.redirectURL = finalURL
-            result.redirectChain = [url, finalURL]
             result.url = finalURL
+            if !Self.isBareRootNormalisation(from: url, to: finalURL) {
+                result.redirectSources = [url]
+                result.redirectURL = finalURL
+                result.redirectChain = [url, finalURL]
+            }
         }
         if check.succeeded, check.hasParseableHTML {
             result.verificationResult = "Fetched via Chrome CDP"

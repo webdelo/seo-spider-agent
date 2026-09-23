@@ -23,14 +23,18 @@ enum HTMLAnalyzer {
         // These tags are injected by WordPress core or plugins. They are useful
         // during development, but normally expose avoidable feed/XML-RPC and
         // shortlink endpoints on a public production site.
-        let rssLinks = (try? doc.select("head link[rel=alternate][type*=rss]").count) ?? 0
-        if rssLinks > 0 { output.wordPressHeadFindings.append("RSS/Comments feed discovery links") }
-        let rsdLinks = (try? doc.select("head link[type*=rsd], head link[rel=EditURI], head link[href*=xmlrpc.php]").count) ?? 0
-        if rsdLinks > 0 { output.wordPressHeadFindings.append("RSD/XML-RPC discovery link") }
-        let shortlinks = (try? doc.select("head link[rel=shortlink]").count) ?? 0
-        if shortlinks > 0 { output.wordPressHeadFindings.append("WordPress shortlink") }
+        func headHrefs(_ selector: String) -> [String] {
+            (try? doc.select(selector).compactMap { try $0.absUrl("href") }.filter { !$0.isEmpty }) ?? []
+        }
+        let rssLinks = headHrefs("head link[rel=alternate][type*=rss]")
+        if !rssLinks.isEmpty { output.wordPressHeadFindings.append("RSS/Comments feed discovery links: \(rssLinks.joined(separator: ", "))") }
+        let rsdLinks = headHrefs("head link[type*=rsd], head link[rel=EditURI], head link[href*=xmlrpc.php]")
+        if !rsdLinks.isEmpty { output.wordPressHeadFindings.append("RSD/XML-RPC discovery link: \(rsdLinks.joined(separator: ", "))") }
+        let shortlinks = headHrefs("head link[rel=shortlink]")
+        if !shortlinks.isEmpty { output.wordPressHeadFindings.append("WordPress shortlink: \(shortlinks.joined(separator: ", "))") }
         let generator = (try? doc.select("head meta[name=generator]").array().map { try $0.attr("content") }) ?? []
-        if generator.contains(where: { $0.localizedCaseInsensitiveContains("wordpress") }) { output.wordPressHeadFindings.append("WordPress version generator meta") }
+        let wordPressGenerator = generator.filter { $0.localizedCaseInsensitiveContains("wordpress") }
+        if !wordPressGenerator.isEmpty { output.wordPressHeadFindings.append("WordPress version generator meta: \(wordPressGenerator.joined(separator: ", "))") }
         output.robots = (try? doc.select("meta[name=robots]").first()?.attr("content")) ?? ""
         output.language = (try? doc.select("html").first()?.attr("lang")) ?? ""
         output.hreflang = (try? doc.select("link[hreflang]").map { try $0.attr("hreflang") }.joined(separator: ", ")) ?? ""

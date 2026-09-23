@@ -238,7 +238,13 @@ final class CrawlViewModel: ObservableObject {
         let urls = raw.compactMap { value -> URL? in
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
             let qualified = trimmed.contains("://") ? trimmed : "https://" + trimmed
-            return URL(string: qualified)
+            // A bare host is the same homepage a browser displays with `/`,
+            // but some servers answer the bare variant with a cosmetic 3xx.
+            // Start from the canonical root spelling so user input cannot
+            // become a false redirect finding.
+            guard var components = URLComponents(string: qualified) else { return nil }
+            if components.path.isEmpty { components.path = "/" }
+            return components.url
         }
         guard !urls.isEmpty else { return }
         // Use one canonical project key regardless of whether a user typed a

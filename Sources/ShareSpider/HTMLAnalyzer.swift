@@ -88,9 +88,30 @@ enum HTMLAnalyzer {
         // Exact-duplicate checks use the full, page-specific main/article area.
         let contentSelectors = "main, article, [role=main], .entry-content, .post-content, .page-content, .article-content"
         let contentBlocks = (try? doc.select(contentSelectors).array()) ?? []
-        if let mainText = contentBlocks
-            .compactMap({ try? $0.text() })
-            .max(by: { $0.count < $1.count }) {
+        let primaryHeading = try? doc.select("body h1").first()
+        let preferredBlock = contentBlocks
+            .filter { block in primaryHeading.map { heading in (try? block.getAllElements().contains(heading)) ?? false } ?? false }
+            .compactMap { try? $0.text() }
+            .max(by: { $0.count < $1.count })
+            ?? contentBlocks.compactMap { try? $0.text() }.max(by: { $0.count < $1.count })
+
+        // Not every CMS uses semantic landmarks. In that case, use the H1's
+        // sibling section — all H2/H3 subsections remain part of the page;
+        // only a following H1 starts a new independent section.
+        func headingSectionText() -> String? {
+            guard let heading = primaryHeading else { return nil }
+            var parts: [String] = []
+            var current = try? heading.nextElementSibling()
+            while let element = current {
+                if element.tagName().lowercased() == "h1" { break }
+                if let text = try? element.text(), !text.isEmpty { parts.append(text) }
+                current = try? element.nextElementSibling()
+            }
+            let text = parts.joined(separator: " ")
+            return text.isEmpty ? nil : text
+        }
+
+        if let mainText = preferredBlock ?? headingSectionText() {
             let normalized = mainText
                 .lowercased()
                 .split(whereSeparator: { $0.isWhitespace })

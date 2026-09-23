@@ -1351,10 +1351,14 @@ struct BacklinksView: View {
                         dataForSEO: [],
                         dataForSEORanks: [:],
                         dataForSEOTypes: [:],
+                        backlinkDetails: [],
                         ahrefs: Set(model.ahrefsBacklinkImport?.domains ?? []),
                         ahrefsRatings: model.ahrefsBacklinkImport?.domainRatings ?? [:],
+                        ahrefsSpamDomains: Set(model.ahrefsBacklinkImport?.spamDomains ?? []),
                         ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
+                        ubersuggestSpamDomains: Set(model.ubersuggestBacklinkImport?.spamDomains ?? []),
                         searchConsole: Set(model.gscBacklinkImport?.donors.map(\.sourceDomain) ?? []),
+                        site: model.startText,
                         loadDataForSEO: model.loadBacklinkSourceAnalysis,
                         loadAhrefs: model.loadAhrefsReferringDomains,
                         loadUbersuggest: model.loadUbersuggestReferringDomains,
@@ -1414,10 +1418,14 @@ struct BacklinksView: View {
                 dataForSEO: Set(activeLinks.map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) }.filter { !$0.isEmpty }),
                 dataForSEORanks: activeDataForSEORanks,
                 dataForSEOTypes: activeDataForSEOTypes,
+                backlinkDetails: model.backlinkSourceDetails,
                 ahrefs: Set(model.ahrefsBacklinkImport?.domains ?? []),
                 ahrefsRatings: model.ahrefsBacklinkImport?.domainRatings ?? [:],
+                ahrefsSpamDomains: Set(model.ahrefsBacklinkImport?.spamDomains ?? []),
                 ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
+                ubersuggestSpamDomains: Set(model.ubersuggestBacklinkImport?.spamDomains ?? []),
                 searchConsole: Set(model.gscBacklinkImport?.donors.map(\.sourceDomain) ?? []),
+                site: model.startText,
                 loadDataForSEO: model.loadBacklinkSourceAnalysis,
                 loadAhrefs: model.loadAhrefsReferringDomains,
                 loadUbersuggest: model.loadUbersuggestReferringDomains,
@@ -1658,10 +1666,14 @@ private struct BacklinkComparisonDashboard: View {
     let dataForSEO: Set<String>
     let dataForSEORanks: [String: Int]
     let dataForSEOTypes: [String: String]
+    let backlinkDetails: [BacklinkSourceDetail]
     let ahrefs: Set<String>
     let ahrefsRatings: [String: Double]
+    let ahrefsSpamDomains: Set<String>
     let ubersuggest: Set<String>
+    let ubersuggestSpamDomains: Set<String>
     let searchConsole: Set<String>
+    let site: String
     let loadDataForSEO: () -> Void
     let loadAhrefs: () -> Void
     let loadUbersuggest: () -> Void
@@ -1690,7 +1702,19 @@ private struct BacklinkComparisonDashboard: View {
                     DomainOverlapPanel(title: "DataForSEO × Ubersuggest × Search Console", segments: triple())
                 }
                 if !dataForSEO.isEmpty || !ahrefs.isEmpty || !ubersuggest.isEmpty || !searchConsole.isEmpty {
-                    ReferringDomainSourceTable(dataForSEO: dataForSEO, dataForSEORanks: dataForSEORanks, dataForSEOTypes: dataForSEOTypes, ahrefs: ahrefs, ahrefsRatings: ahrefsRatings, ubersuggest: ubersuggest, searchConsole: searchConsole)
+                    ReferringDomainSourceTable(
+                        dataForSEO: dataForSEO,
+                        dataForSEORanks: dataForSEORanks,
+                        dataForSEOTypes: dataForSEOTypes,
+                        backlinkDetails: backlinkDetails,
+                        ahrefs: ahrefs,
+                        ahrefsRatings: ahrefsRatings,
+                        ahrefsSpamDomains: ahrefsSpamDomains,
+                        ubersuggest: ubersuggest,
+                        ubersuggestSpamDomains: ubersuggestSpamDomains,
+                        searchConsole: searchConsole,
+                        site: site
+                    )
                 }
             }
         }
@@ -1721,9 +1745,11 @@ private struct BacklinkComparisonDashboard: View {
 
 private struct ReferringDomainSourceRow: Identifiable {
     let domain: String
+    let detailURLs: [String]
     let ahrefsDR: Double?
     let dataForSEORank: Int?
     let donorType: String
+    let anchors: String
     let inAhrefs: Bool
     let inDataForSEO: Bool
     let inUbersuggest: Bool
@@ -1737,19 +1763,64 @@ private struct ReferringDomainSourceTable: View {
     let dataForSEO: Set<String>
     let dataForSEORanks: [String: Int]
     let dataForSEOTypes: [String: String]
+    let backlinkDetails: [BacklinkSourceDetail]
     let ahrefs: Set<String>
     let ahrefsRatings: [String: Double]
+    let ahrefsSpamDomains: Set<String>
     let ubersuggest: Set<String>
+    let ubersuggestSpamDomains: Set<String>
     let searchConsole: Set<String>
+    let site: String
+
+    private var detailsByDomain: [String: [BacklinkSourceDetail]] {
+        Dictionary(grouping: backlinkDetails) {
+            GSCBacklinkImportService.normalizedDomain($0.sourceDomain)
+        }
+    }
+
+    private var normalizedAhrefsSpamDomains: Set<String> {
+        Set(ahrefsSpamDomains.map(GSCBacklinkImportService.normalizedDomain))
+    }
+
+    private var normalizedUbersuggestSpamDomains: Set<String> {
+        Set(ubersuggestSpamDomains.map(GSCBacklinkImportService.normalizedDomain))
+    }
+
+    private func anchorSummary(for domain: String) -> String {
+        let anchors = detailsByDomain[domain, default: []]
+            .map { $0.anchor.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var seen = Set<String>()
+        let unique = anchors.filter { seen.insert($0.lowercased()).inserted }
+        guard !unique.isEmpty else { return "—" }
+        return unique.joined(separator: " | ")
+    }
+
+    private func detailURLs(for domain: String) -> [String] {
+        var seen = Set<String>()
+        return detailsByDomain[domain, default: []]
+            .map { $0.sourceURL.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+            .sorted()
+    }
+
+    private func donorType(for domain: String) -> String {
+        if let known = dataForSEOTypes[domain] { return known }
+        let priority: [BacklinkClassifier.DonorType] = [.spam, .pbn, .web20, .catalog, .profile, .crowd, .article, .homepage, .redirect, .internationalNetwork, .unknown]
+        let types = Set(detailsByDomain[domain, default: []].map { BacklinkClassifier.donorType(for: $0) })
+        return (priority.first { types.contains($0) } ?? .unknown).rawValue
+    }
 
     private var rows: [ReferringDomainSourceRow] {
         let all = dataForSEO.union(ahrefs).union(ubersuggest).union(searchConsole)
         return all.map { domain in
             ReferringDomainSourceRow(
                 domain: domain,
+                detailURLs: detailURLs(for: domain),
                 ahrefsDR: ahrefsRatings[domain],
                 dataForSEORank: dataForSEORanks[domain],
-                donorType: dataForSEOTypes[domain] ?? "Не определено",
+                donorType: donorType(for: domain),
+                anchors: anchorSummary(for: domain),
                 inAhrefs: ahrefs.contains(domain),
                 inDataForSEO: dataForSEO.contains(domain),
                 inUbersuggest: ubersuggest.contains(domain),
@@ -1763,18 +1834,106 @@ private struct ReferringDomainSourceTable: View {
         }
     }
 
+    private var anchorRows: [(anchor: String, count: Int, percent: Double)] {
+        let grouped = Dictionary(grouping: backlinkDetails) { item -> String in
+            let value = item.anchor.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? "(без анкора)" : value
+        }
+        let total = max(1, backlinkDetails.count)
+        let values: [(anchor: String, count: Int, percent: Double)] = grouped.map { key, value in
+            (anchor: key, count: value.count, percent: Double(value.count) * 100 / Double(total))
+        }
+        let sorted = values.sorted { lhs, rhs in
+            if lhs.count != rhs.count { return lhs.count > rhs.count }
+            return lhs.anchor.localizedCaseInsensitiveCompare(rhs.anchor) == .orderedAscending
+        }
+        return Array(sorted.prefix(20))
+    }
+
+    private var summary: (total: Int, spam: Int, quality: Int, drAboveTen: Int, active: Int, broken: Int, lost: Int) {
+        let allDomains = Set(rows.map(\.domain))
+        let spam = allDomains.filter { domain in
+            normalizedAhrefsSpamDomains.contains(domain)
+                || normalizedUbersuggestSpamDomains.contains(domain)
+                || detailsByDomain[domain, default: []].contains { BacklinkClassifier.donorType(for: $0) == .spam }
+        }
+        let active = Set(backlinkDetails.filter { !$0.isLost }.map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) })
+        let lost = Set(backlinkDetails.filter(\.isLost).map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) })
+        let broken = Set(backlinkDetails.filter { $0.broken || $0.sourceStatusCode >= 400 }.map { GSCBacklinkImportService.normalizedDomain($0.sourceDomain) })
+        let drAboveTen = allDomains.filter { domain in
+            max(ahrefsRatings[domain] ?? 0, Double(dataForSEORanks[domain] ?? 0)) > 10
+        }
+        let quality = drAboveTen.subtracting(spam).subtracting(broken).subtracting(lost)
+        return (allDomains.count, spam.count, quality.count, drAboveTen.count, active.count, broken.count, lost.count)
+    }
+
+    private var exportRows: [[String]] {
+        rows.map { row in
+            let details = detailsByDomain[row.domain, default: []]
+            let statuses = [details.contains(where: { !$0.isLost }) ? "Active" : nil, details.contains(where: \.isLost) ? "Lost" : nil].compactMap { $0 }.joined(separator: " | ")
+            let isBroken = details.contains { $0.broken || $0.sourceStatusCode >= 400 }
+            return [
+                row.domain,
+                row.detailURLs.joined(separator: " | "),
+                row.ahrefsDR.map { String(format: "%.1f", $0) } ?? "",
+                row.dataForSEORank.map(String.init) ?? "",
+                row.anchors == "—" ? "" : row.anchors,
+                row.donorType,
+                statuses,
+                isBroken ? "Yes" : "No",
+                row.inAhrefs ? "Yes" : "No",
+                row.inDataForSEO ? "Yes" : "No",
+                row.inUbersuggest ? "Yes" : "No",
+                row.inSearchConsole ? "Yes" : "No"
+            ]
+        }
+    }
+
+    private func exportComparison() {
+        URLListTransfer.export(
+            name: "Referring-Domain-Comparison",
+            header: ["Domain", "Detailed source URLs", "Ahrefs DR", "DataForSEO DR", "Anchors", "Page type", "Known status", "Broken", "Ahrefs", "DataForSEO", "Ubersuggest", "Search Console"],
+            rows: exportRows,
+            site: site
+        )
+    }
+
     var body: some View {
         GroupBox("Referring-domain comparison") {
             VStack(alignment: .leading, spacing: 7) {
-                Text("\(rows.count) unique domains · sorted by Ahrefs DR (highest first). A checkmark means the provider reported this donor in its imported dataset.")
-                    .font(.caption).foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline) {
+                    Text("\(rows.count) unique domains · sorted by Ahrefs DR (highest first). A checkmark means the provider reported this donor in its imported dataset.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        exportComparison()
+                    } label: {
+                        Label("Export table", systemImage: "square.and.arrow.down")
+                    }
+                    .disabled(rows.isEmpty)
+                }
                 Table(rows) {
-                    TableColumn("Domain") { Text($0.domain).textSelection(.enabled) }.width(min: 240, ideal: 330)
+                    TableColumn("Domain") { row in
+                        HStack(spacing: 7) {
+                            Text(row.domain).lineLimit(1).textSelection(.enabled)
+                            if let value = row.detailURLs.first, let url = URL(string: value) {
+                                URLActions(url: url)
+                            }
+                            if row.detailURLs.count > 1 {
+                                Text("+\(row.detailURLs.count - 1)")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .help(row.detailURLs.joined(separator: "\n"))
+                            }
+                        }
+                    }.width(min: 270, ideal: 380)
                     TableColumn("Ahrefs DR") { row in Text(row.ahrefsDR.map { String(format: "%.1f", $0) } ?? "—").monospacedDigit() }.width(85)
                     TableColumn("DataForSEO DR") { row in
                         Text(row.dataForSEORank.map(String.init) ?? "—").monospacedDigit()
                     }.width(105)
-                    TableColumn("Link type") { row in
+                    TableColumn("Anchor") { row in
+                        Text(row.anchors).lineLimit(2).help(row.anchors)
+                    }.width(min: 160, ideal: 240)
+                    TableColumn("Page type") { row in
                         Text(row.donorType).lineLimit(1)
                     }.width(min: 115, ideal: 150)
                     TableColumn("Ahrefs") { sourceMark($0.inAhrefs) }.width(68)
@@ -1782,9 +1941,53 @@ private struct ReferringDomainSourceTable: View {
                     TableColumn("Ubersuggest") { sourceMark($0.inUbersuggest) }.width(100)
                     TableColumn("Search Console") { sourceMark($0.inSearchConsole) }.width(115)
                 }
-                .frame(height: 280)
+                .frame(height: max(92, CGFloat(rows.count) * 28 + 38))
+
+                if !anchorRows.isEmpty {
+                    Divider().padding(.vertical, 4)
+                    Text("Top 20 anchors").font(.headline)
+                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
+                        GridRow {
+                            Text("Anchor").fontWeight(.semibold)
+                            Text("Links").fontWeight(.semibold)
+                            Text("Share").fontWeight(.semibold)
+                        }
+                        Divider().gridCellUnsizedAxes(.horizontal)
+                        ForEach(Array(anchorRows.enumerated()), id: \.offset) { _, item in
+                            GridRow {
+                                Text(item.anchor).lineLimit(2).textSelection(.enabled)
+                                Text("\(item.count)").monospacedDigit()
+                                Text(String(format: "%.1f%%", item.percent)).monospacedDigit()
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider().padding(.vertical, 4)
+                Text("Donor summary").font(.headline)
+                let values = summary
+                Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
+                    summaryRow("Всего доноров", values.total)
+                    summaryRow("Спамные", values.spam)
+                    summaryRow("Качественные", values.quality)
+                    summaryRow("С DR выше 10", values.drAboveTen)
+                    summaryRow("Активные", values.active)
+                    summaryRow("Сломанные", values.broken)
+                    summaryRow("Потерянные", values.lost)
+                }
+                Text("Качественные: DR выше 10, без признаков спама, поломки или потери. Active/Lost/Broken считаются только там, где источник передал статус ссылки.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func summaryRow(_ title: String, _ value: Int) -> some View {
+        GridRow {
+            Text(title)
+            Text("\(value)").monospacedDigit().fontWeight(.semibold)
         }
     }
 

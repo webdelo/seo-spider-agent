@@ -656,7 +656,7 @@ struct AffectedURLsView: View {
                         description: Text("Google supplied the category total but did not provide individual URLs in this report. The existing crawl data is not replaced.")
                     )
                 } else {
-                    AffectedCrawlRecordList(records: records, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-URLs", site: model.startText)
+                    AffectedCrawlRecordList(records: records, metric: metric, exportName: "\(metric.replacingOccurrences(of: "/", with: "-"))-URLs", site: model.startText)
                     Button("Open filtered table in URLs") { showURLs() }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
@@ -672,6 +672,7 @@ private struct AffectedImageList: View {
     let exportName: String
     let site: String
     @State private var selection = Set<String>()
+    @State private var expandedSources = Set<String>()
 
     private var selected: [OverviewImageItem] { items.filter { selection.contains($0.id) } }
     private var exportRows: [[String]] {
@@ -694,18 +695,18 @@ private struct AffectedImageList: View {
                         Text(item.imageURL).textSelection(.enabled).lineLimit(1)
                         Spacer()
                         if let url = URL(string: item.imageURL) { URLActions(url: url) }
-                    }
-                    DisclosureGroup("Found on \(item.pageURLs.count) page\(item.pageURLs.count == 1 ? "" : "s")") {
-                        ForEach(item.pageURLs, id: \.self) { pageURL in
-                            HStack {
-                                Text(pageURL.absoluteString).font(.caption).textSelection(.enabled).lineLimit(1)
-                                Spacer()
-                                URLActions(url: pageURL)
-                            }.padding(.vertical, 2)
+                        Button {
+                            if expandedSources.contains(item.id) { expandedSources.remove(item.id) }
+                            else { expandedSources.insert(item.id) }
+                        } label: {
+                            Image(systemName: expandedSources.contains(item.id) ? "minus.circle" : "plus.circle")
                         }
+                        .buttonStyle(.plain)
+                        .help(expandedSources.contains(item.id) ? "Hide pages where this image is used" : "Show pages where this image is used")
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    if expandedSources.contains(item.id) {
+                        FoundOnLinks(urls: item.pageURLs)
+                    }
                 }
                 .padding(.vertical, 4)
             }
@@ -718,13 +719,31 @@ private struct AffectedImageList: View {
 /// shows only pages attached to that metric, never the rest of the audit.
 private struct AffectedCrawlRecordList: View {
     let records: [CrawlRecord]
+    let metric: String
     let exportName: String
     let site: String
     @State private var selection = Set<CrawlRecord.ID>()
+    @State private var expandedSources = Set<CrawlRecord.ID>()
 
     private var selectedRecords: [CrawlRecord] { records.filter { selection.contains($0.id) } }
     private var exportRows: [[String]] {
         records.map { [$0.url.absoluteString, $0.statusText, $0.title, $0.displayPageType] }
+    }
+
+    /// Metadata and markup findings belong to the page shown in the first
+    /// column. Resource and link findings are different: the target URL alone
+    /// does not say where an editor needs to replace an image or hyperlink.
+    private var showsReferenceSources: Bool {
+        let name = metric.lowercased()
+        if ["title", "description", "canonical", "hreflang", "h1", "h2", "meta", "directives", "url", "content", "schema"].contains(where: name.contains) {
+            return false
+        }
+        return ["response", "error", "redirect", "redirection", "external", "broken image", "heavy image", "mixed content", "resource"].contains(where: name.contains)
+    }
+
+    private func sourcePages(for record: CrawlRecord) -> [URL] {
+        Array(Set(record.foundOnURLs.filter { $0 != record.url }))
+            .sorted { $0.absoluteString < $1.absoluteString }
     }
 
     var body: some View {
@@ -739,7 +758,27 @@ private struct AffectedCrawlRecordList: View {
             }
             Table(records, selection: $selection) {
                 TableColumn("URL") { record in
-                    HStack { Text(record.url.absoluteString).lineLimit(1); Spacer(); URLActions(url: record.url) }
+                    let sources = sourcePages(for: record)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(record.url.absoluteString).lineLimit(1)
+                            Spacer()
+                            URLActions(url: record.url)
+                            if showsReferenceSources && !sources.isEmpty {
+                                Button {
+                                    if expandedSources.contains(record.id) { expandedSources.remove(record.id) }
+                                    else { expandedSources.insert(record.id) }
+                                } label: {
+                                    Image(systemName: expandedSources.contains(record.id) ? "minus.circle" : "plus.circle")
+                                }
+                                .buttonStyle(.plain)
+                                .help(expandedSources.contains(record.id) ? "Hide pages where this URL is used" : "Show pages where this URL is used")
+                            }
+                        }
+                        if showsReferenceSources && expandedSources.contains(record.id) {
+                            FoundOnLinks(urls: sources)
+                        }
+                    }
                 }.width(min: 280, ideal: 500)
                 TableColumn("Status") { Text($0.statusText) }.width(60)
                 TableColumn("Title") { Text($0.title).lineLimit(1) }.width(min: 120, ideal: 220)

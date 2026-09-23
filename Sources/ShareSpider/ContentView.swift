@@ -1905,7 +1905,7 @@ private struct FlowLayout: Layout {
 }
 
 private enum AIAuditScenario: String, CaseIterable, Identifiable {
-    case rankingDrop, newClient, quickWins, developerPlan, contentPlan, indexationRisk
+    case rankingDrop, newClient, quickWins, developerPlan, developerBrief, contentPlan, indexationRisk
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -1913,6 +1913,7 @@ private enum AIAuditScenario: String, CaseIterable, Identifiable {
         case .newClient: "Это аудит сайта для нового клиента"
         case .quickWins: "Нужно найти быстрые точки роста"
         case .developerPlan: "Нужно подготовить приоритеты для разработчика"
+        case .developerBrief: "Проверить ошибки и подготовить короткий текст для разработчика"
         case .contentPlan: "Нужно подготовить приоритеты для контент-команды"
         case .indexationRisk: "Нужно оценить риски индексации и видимости"
         }
@@ -1933,34 +1934,14 @@ struct AuditView: View {
     @State private var importedPositionsFile: ImportedPositionsFile?
     var body: some View {
         AnyView(auditContent)
+            .textSelection(.enabled)
+            .background(Color.white)
     }
 
     private var auditContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    VStack(alignment: .leading) {
-                        Text("Audit").font(.title2.weight(.semibold))
-                        Text("Technical audit and AI-assisted analysis of crawl, backlink and Search Console data.").foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button(model.auditRunning ? "Auditing…" : "Run Audit") { model.runAudit() }.buttonStyle(.borderedProminent).disabled(model.auditRunning || model.records.isEmpty)
-                    Button("Export Audit PDF") { exportAuditPDF() }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.auditReport == nil || model.auditRunning)
-                    Button(model.aiAuditRunning ? "Running AI Audit…" : "AI Helper") { aiContextExpanded = true }
-                        .disabled(model.aiAuditRunning || model.auditReport == nil)
-                    Button("Reset results", role: .destructive) { model.resetAuditAndCrawl() }
-                        .disabled(model.auditRunning || model.aiAuditRunning || model.visualAuditRunning || model.pageSpeedRunning)
-                    if model.auditReport != nil {
-                        Button("Export developer report") { model.exportTechnicalTasks() }
-                        .help("Saves one developer report with High and Medium priority findings.")
-                        .disabled(model.auditRunning || model.records.isEmpty)
-                    }
-                    if model.aiAuditReport != nil {
-                        Button("Export AI Audit PDF") { model.exportAIAuditPDF() }.disabled(model.aiAuditRunning)
-                    }
-                }
+                auditHeader
                 aiAuditResults
                 if let report = model.auditReport {
                     aiAuditContextControls
@@ -2171,7 +2152,28 @@ struct AuditView: View {
                 } else {
                     ContentUnavailableView("Run technical audit", systemImage: "checklist", description: Text("First crawl the site, then press Run Audit."))
                 }
-            }.padding()
+            }
+            .padding()
+        }
+    }
+    private var auditHeader: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text("Audit").font(.title2.weight(.semibold))
+                Text("Technical audit and AI-assisted analysis of crawl, backlink and Search Console data.").foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(model.auditRunning ? "Auditing…" : "Run Audit") { model.runAudit() }.buttonStyle(.borderedProminent).disabled(model.auditRunning || model.records.isEmpty)
+            Button("Export Audit PDF") { exportAuditPDF() }.buttonStyle(.borderedProminent).disabled(model.auditReport == nil || model.auditRunning)
+            Button(model.aiAuditRunning ? "Running AI Audit…" : "AI Helper") { aiContextExpanded = true }.disabled(model.aiAuditRunning || model.auditReport == nil)
+            Button("Export AI Audit PDF") { model.exportAIAuditPDF() }.disabled(model.aiAuditReport == nil || model.aiAuditRunning)
+            Button("Reset results", role: .destructive) { model.resetAuditAndCrawl() }
+                .disabled(model.auditRunning || model.aiAuditRunning || model.visualAuditRunning || model.pageSpeedRunning)
+            if model.auditReport != nil {
+                Button("Export developer report") { model.exportTechnicalTasks() }
+                    .help("Saves one developer report with High and Medium priority findings.")
+                    .disabled(model.auditRunning || model.records.isEmpty)
+            }
         }
     }
     private var aiAuditContextControls: some View {
@@ -2263,6 +2265,9 @@ struct AuditView: View {
             GroupBox("Executive summary") { Text(report.executiveSummary).fontWeight(.bold).frame(maxWidth: .infinity, alignment: .leading) }
             if !report.holisticOpinion.isEmpty {
                 GroupBox("Цельное мнение о сайте") { Text(report.holisticOpinion).frame(maxWidth: .infinity, alignment: .leading) }
+            }
+            if !report.developerBrief.isEmpty {
+                GroupBox("Коротко для разработчика") { Text(report.developerBrief).frame(maxWidth: .infinity, alignment: .leading) }
             }
             HStack(spacing: 10) {
                 AIAuditSummaryCard(title: "Crawl", detail: "\(report.crawlSummary.totalURLs) URLs · \(report.crawlSummary.errorCount) errors\n\(report.crawlSummary.successfulTitledPages) HTML 200 pages with title\nSitemap: \(report.crawlSummary.sitemapAvailable ? "\(report.crawlSummary.sitemapURLs) URLs" : "not found")")

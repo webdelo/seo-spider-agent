@@ -22,6 +22,7 @@ struct AIAuditReport: Sendable {
     var searchConsoleAnalysis: String
     var executiveSummary: String
     var holisticOpinion: String = ""
+    var developerBrief: String = ""
     var findings: [AIAuditFinding]
     var crawlSummary: AIAuditCrawlSummary
     var backlinkSummary: AIAuditBacklinkSummary

@@ -1209,7 +1209,7 @@ final class CrawlViewModel: ObservableObject {
             await MainActor.run { self.auditReport = report; self.auditRunning = false }
         }
     }
-    func runAIAudit() {
+    func runAIAudit(userBrief: AIAuditBrief = .init()) {
         guard !aiAuditRunning, !records.isEmpty else { return }
         aiAuditRunning = true
         aiAuditStage = .collectingData
@@ -1218,7 +1218,7 @@ final class CrawlViewModel: ObservableObject {
         let auditRecords = records, auditOverview = overview, auditIssues = issues
         let auditDomains = referringDomainDetails, auditSources = backlinkSourceDetails
         Task { [weak self] in
-            let report = await AIAuditAnalyzer.analyze(data: data, startURL: startURL, records: auditRecords, overview: auditOverview, issues: auditIssues, referringDomainDetails: auditDomains, backlinkSourceDetails: auditSources) { stage in
+            let report = await AIAuditAnalyzer.analyze(data: data, startURL: startURL, records: auditRecords, overview: auditOverview, issues: auditIssues, referringDomainDetails: auditDomains, backlinkSourceDetails: auditSources, userBrief: userBrief) { stage in
                 self?.aiAuditStage = stage
             }
             guard !Task.isCancelled else { return }

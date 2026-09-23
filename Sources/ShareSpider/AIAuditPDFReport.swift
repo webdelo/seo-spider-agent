@@ -26,6 +26,7 @@ private final class AIAuditPDFRenderer {
         paragraph(report.siteURL, font: .systemFont(ofSize: 13, weight: .semibold), color: purple)
         paragraph("Generated \(report.generatedAt.formatted(date: .long, time: .shortened))", font: .systemFont(ofSize: 10.5), color: muted, spacing: 16)
         section("Executive summary"); paragraph(report.executiveSummary, font: .systemFont(ofSize: 11, weight: .semibold), color: ink)
+        if !report.holisticOpinion.isEmpty { section("Цельное мнение о сайте"); paragraph(report.holisticOpinion, font: .systemFont(ofSize: 10.5, weight: .medium), color: ink) }
         section("Data source summary"); summaryCards()
         section("Анализ ссылочного профиля"); paragraph(report.backlinkAnalysis, color: ink)
         section("Детали ссылочного профиля"); paragraph(backlinkDetails(), font: .systemFont(ofSize: 9), color: muted)

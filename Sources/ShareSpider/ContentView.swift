@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Charts
+import UniformTypeIdentifiers
 
 /// Toolbar views can be recomputed many times while macOS restores a window.
 /// Resolving a package resource from `body` made that restoration loop spend
@@ -1903,9 +1904,33 @@ private struct FlowLayout: Layout {
     }
 }
 
+private enum AIAuditScenario: String, CaseIterable, Identifiable {
+    case rankingDrop, newClient, quickWins, developerPlan, contentPlan, indexationRisk
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .rankingDrop: "Это аудит сайта, так как недавно упали позиции"
+        case .newClient: "Это аудит сайта для нового клиента"
+        case .quickWins: "Нужно найти быстрые точки роста"
+        case .developerPlan: "Нужно подготовить приоритеты для разработчика"
+        case .contentPlan: "Нужно подготовить приоритеты для контент-команды"
+        case .indexationRisk: "Нужно оценить риски индексации и видимости"
+        }
+    }
+}
+
+private struct ImportedPositionsFile {
+    var name: String
+    var content: String
+}
+
 struct AuditView: View {
     @ObservedObject var model: CrawlViewModel
     @State private var enlargedScreenshot: VisualAuditResult?
+    @State private var aiContextExpanded = false
+    @State private var selectedAIScenarios = Set<String>()
+    @State private var customAIQuestion = ""
+    @State private var importedPositionsFile: ImportedPositionsFile?
     var body: some View {
         AnyView(auditContent)
     }
@@ -1920,15 +1945,14 @@ struct AuditView: View {
                     }
                     Spacer()
                     Button(model.auditRunning ? "Auditing…" : "Run Audit") { model.runAudit() }.buttonStyle(.borderedProminent).disabled(model.auditRunning || model.records.isEmpty)
-                    Button(model.aiAuditRunning ? "Running AI Audit…" : "AI Helper") { model.runAIAudit() }.buttonStyle(.borderedProminent).disabled(model.aiAuditRunning || model.records.isEmpty)
+                    Button("Export Audit PDF") { exportAuditPDF() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.auditReport == nil || model.auditRunning)
+                    Button(model.aiAuditRunning ? "Running AI Audit…" : "AI Helper") { aiContextExpanded = true }
+                        .disabled(model.aiAuditRunning || model.auditReport == nil)
                     Button("Reset results", role: .destructive) { model.resetAuditAndCrawl() }
                         .disabled(model.auditRunning || model.aiAuditRunning || model.visualAuditRunning || model.pageSpeedRunning)
-                    if let report = model.auditReport {
-                        Button("Export audit PDF") {
-                            if let url = ClientPDFReport.export(report: report, records: model.records, issues: model.issues, approvedVisualIDs: model.approvedVisualIssueIDs, startURL: model.startText) {
-                                NSWorkspace.shared.activateFileViewerSelecting([url])
-                            }
-                        }.disabled(model.auditRunning)
+                    if model.auditReport != nil {
                         Button("Export developer report") { model.exportTechnicalTasks() }
                         .help("Saves one developer report with High and Medium priority findings.")
                         .disabled(model.auditRunning || model.records.isEmpty)
@@ -1939,6 +1963,7 @@ struct AuditView: View {
                 }
                 aiAuditResults
                 if let report = model.auditReport {
+                    aiAuditContextControls
                     GroupBox("Domain profile") {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Primary server IP: \(report.siteProfile.ipAddresses.first ?? "could not be resolved")")
@@ -2149,6 +2174,78 @@ struct AuditView: View {
             }.padding()
         }
     }
+    private var aiAuditContextControls: some View {
+        DisclosureGroup("AI Helper · контекст задачи", isExpanded: $aiContextExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("AI получает весь результат аудита, а затем сам формулирует и проверяет уточняющие вопросы. Выберите только нужный контекст — он влияет на расстановку приоритетов.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(AIAuditScenario.allCases) { scenario in
+                    Toggle(scenario.title, isOn: Binding(
+                        get: { selectedAIScenarios.contains(scenario.rawValue) },
+                        set: { enabled in
+                            if enabled { selectedAIScenarios.insert(scenario.rawValue) }
+                            else { selectedAIScenarios.remove(scenario.rawValue) }
+                        }
+                    ))
+                    .toggleStyle(.checkbox)
+                }
+                HStack(spacing: 10) {
+                    Button("Прикрепить файл позиций и ключей…") { importPositionsFile() }
+                    if let file = importedPositionsFile {
+                        Text(file.name).lineLimit(1).foregroundStyle(.secondary)
+                        Button("Удалить", role: .destructive) { importedPositionsFile = nil }.controlSize(.small)
+                    } else {
+                        Text("CSV, TSV или TXT; адреса, ключи и позиции.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Ваш вопрос для AI").font(.subheadline.weight(.medium))
+                    TextEditor(text: $customAIQuestion)
+                        .font(.body)
+                        .frame(minHeight: 82)
+                        .padding(6)
+                        .background(.background, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
+                    Text("Например: «Почему могли снизиться позиции по услугам и с чего начать исправления?»").font(.caption).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Spacer()
+                    Button(model.aiAuditRunning ? "AI анализирует…" : "Запустить AI-анализ") {
+                        model.runAIAudit(userBrief: AIAuditBrief(
+                            scenarios: AIAuditScenario.allCases.filter { selectedAIScenarios.contains($0.rawValue) }.map(\.title),
+                            customQuestion: customAIQuestion,
+                            positionsFileName: importedPositionsFile?.name ?? "",
+                            positionsFileContent: importedPositionsFile?.content ?? ""
+                        ))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.aiAuditRunning)
+                }
+            }
+            .padding(.top, 8)
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.32), in: RoundedRectangle(cornerRadius: 10))
+    }
+    private func exportAuditPDF() {
+        guard let report = model.auditReport else { return }
+        if let url = ClientPDFReport.export(report: report, records: model.records, issues: model.issues, approvedVisualIDs: model.approvedVisualIssueIDs, startURL: model.startText) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+    private func importPositionsFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Прикрепить файл позиций и ключей"
+        panel.message = "Можно прикрепить CSV, TSV или TXT с адресами, ключами и позициями."
+        panel.allowedContentTypes = [.commaSeparatedText, .tabSeparatedText, .plainText, .utf8PlainText, .text]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        let limit = 250_000
+        let clipped = String(text.prefix(limit))
+        importedPositionsFile = .init(name: url.lastPathComponent, content: clipped)
+    }
     @ViewBuilder
     private var aiAuditResults: some View {
         if model.aiAuditRunning {
@@ -2164,6 +2261,9 @@ struct AuditView: View {
         }
         if let report = model.aiAuditReport {
             GroupBox("Executive summary") { Text(report.executiveSummary).fontWeight(.bold).frame(maxWidth: .infinity, alignment: .leading) }
+            if !report.holisticOpinion.isEmpty {
+                GroupBox("Цельное мнение о сайте") { Text(report.holisticOpinion).frame(maxWidth: .infinity, alignment: .leading) }
+            }
             HStack(spacing: 10) {
                 AIAuditSummaryCard(title: "Crawl", detail: "\(report.crawlSummary.totalURLs) URLs · \(report.crawlSummary.errorCount) errors\n\(report.crawlSummary.successfulTitledPages) HTML 200 pages with title\nSitemap: \(report.crawlSummary.sitemapAvailable ? "\(report.crawlSummary.sitemapURLs) URLs" : "not found")")
                 AIAuditSummaryCard(title: "Backlinks", detail: "\(report.backlinkSummary.totalBacklinks) active links\n\(report.backlinkSummary.referringDomains) referring domains")

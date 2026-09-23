@@ -19,19 +19,27 @@ enum AICodexAnalyst {
     private struct ChatRequest: Encodable { struct Message: Encodable { var role: String; var content: String }; var model: String; var messages: [Message] }
     private struct ChatResponse: Decodable { struct Choice: Decodable { struct Message: Decodable { var content: String? }; var message: Message }; var choices: [Choice] }
 
-    static func analyze(context: AuditContext, onProgress: @escaping @Sendable (Int, Int) -> Void) async -> [CustomAnalysis] {
+    static func analyze(context: AuditContext, holisticOpinion: String = "", onProgress: @escaping @Sendable (Int, Int) -> Void) async -> [CustomAnalysis] {
         guard let contextJSON = try? String(decoding: JSONEncoder().encode(context), as: UTF8.self) else { return [] }
         let temporaryURL = FileManager.default.temporaryDirectory.appendingPathComponent("audit-context-\(UUID().uuidString).json")
         try? contextJSON.data(using: .utf8)?.write(to: temporaryURL, options: .atomic)
         defer { try? FileManager.default.removeItem(at: temporaryURL) }
         let prompt = """
-        You are an SEO analyst. Analyze the following SEO audit context JSON and identify 0-10 anomalies, contradictions, or patterns that need deeper investigation. For each finding, create a custom analysis prompt.
+        You are an SEO analyst. The JSON contains the complete audit snapshot and, optionally, a user brief with the business scenario, a positions/keywords file and a direct question. A whole-site opinion was already prepared from the same complete context; use it as a lead, but do not treat its hypotheses as facts. Use all of it to identify 0-10 anomalies, contradictions, or patterns that need deeper investigation. The user's direct question must become a question if it is not empty. For each finding, create a custom analysis prompt.
         Return ONLY a JSON array. Each element must have "question", "reason", "sourceData", and "needsLLM". sourceData must name relevant context fields. Only create prompts for genuine anomalies; otherwise return [].
+        Whole-site opinion:
+        \(holisticOpinion)
+
         Audit context JSON:
         \(contextJSON)
         """
         guard let output = await runCodex(prompt), let prompts = decodePrompts(output) else { return [] }
-        let limited = Array(prompts.prefix(10))
+        var selected = prompts
+        let directQuestion = context.userBrief.customQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !directQuestion.isEmpty && !selected.contains(where: { $0.question.localizedCaseInsensitiveContains(directQuestion) }) {
+            selected.insert(.init(question: directQuestion, reason: "Прямой вопрос пользователя в контексте аудита", sourceData: "full audit context and userBrief", needsLLM: true), at: 0)
+        }
+        let limited = Array(selected.prefix(10))
         var analyses: [CustomAnalysis] = []
         for (index, prompt) in limited.enumerated() {
             let relevantData = subset(of: context, named: prompt.sourceData)
@@ -62,7 +70,10 @@ enum AICodexAnalyst {
     private static func subset(of context: AuditContext, named source: String) -> String {
         let normalized = source.lowercased()
         let value: AnyEncodable = normalized.contains("backlink") ? .init(context.backlinkSummary) : normalized.contains("gsc") || normalized.contains("searchconsole") ? .init(context.gscSummary) : normalized.contains("issue") ? .init(context.issues) : normalized.contains("schema") ? .init(context.schemaTypesDistribution) : normalized.contains("page") ? .init(context.pageTypeDistribution) : .init(context)
-        return (try? String(decoding: JSONEncoder().encode(value), as: UTF8.self)) ?? "{}"
+        let data = (try? String(decoding: JSONEncoder().encode(value), as: UTF8.self)) ?? "{}"
+        guard !context.userBrief.isEmpty, !normalized.contains("userbrief") else { return data }
+        let brief = (try? String(decoding: JSONEncoder().encode(context.userBrief), as: UTF8.self)) ?? "{}"
+        return "User brief (always consider): \(brief)\nRelevant audit data: \(data)"
     }
     private static func verify(result: String, context: AuditContext, unavailable: Bool) -> (status: String, confidence: String, note: String) {
         guard !unavailable else { return ("Unable to verify", "Low", "No result was available to verify.") }

@@ -83,10 +83,24 @@ enum HTMLAnalyzer {
         output.domNodeCount = (try? doc.getAllElements().count) ?? 0
         output.inlineJavaScriptSize = (try? doc.select("script:not([src])").array().reduce(0) { $0 + ((try? $1.html()) ?? "").lengthOfBytes(using: .utf8) }) ?? 0
         output.inlineCSSSize = (try? doc.select("style").array().reduce(0) { $0 + ((try? $1.html()) ?? "").lengthOfBytes(using: .utf8) }) ?? 0
-        // Only the opening content is used for duplicate detection. Limit the
-        // split itself, rather than splitting an entire multi-megabyte page.
-        let fingerprintWords = bodyText.split(maxSplits: 250, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
-        output.contentFingerprint = String(fingerprintWords.prefix(250).joined(separator: " ").lowercased().hashValue)
+        // Do not fingerprint the opening of `body`: on most sites it is the
+        // shared header/navigation and makes unrelated pages look identical.
+        // Exact-duplicate checks use the full, page-specific main/article area.
+        let contentSelectors = "main, article, [role=main], .entry-content, .post-content, .page-content, .article-content"
+        let contentBlocks = (try? doc.select(contentSelectors).array()) ?? []
+        if let mainText = contentBlocks
+            .compactMap({ try? $0.text() })
+            .max(by: { $0.count < $1.count }) {
+            let normalized = mainText
+                .lowercased()
+                .split(whereSeparator: { $0.isWhitespace })
+                .joined(separator: " ")
+            // Very short interface fragments are not meaningful content and
+            // must not form a duplicate-content group.
+            if normalized.split(separator: " ").count >= 80 {
+                output.contentFingerprint = String(normalized.hashValue)
+            }
+        }
         let jsonLD = (try? doc.select("script[type=application/ld+json]").array().compactMap { try $0.html() }.joined(separator: "\n")) ?? ""
         output.schemaJSON = jsonLD
         output.embeddedJSONSize = jsonLD.lengthOfBytes(using: .utf8)

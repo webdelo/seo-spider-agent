@@ -751,6 +751,18 @@ private struct AffectedCrawlRecordList: View {
         metric.localizedCaseInsensitiveContains("technical head")
     }
 
+    private var isDuplicateContentMetric: Bool {
+        metric.localizedCaseInsensitiveContains("duplicate content")
+    }
+
+    private func duplicatePages(for record: CrawlRecord) -> [URL] {
+        guard !record.contentFingerprint.isEmpty else { return [] }
+        return allRecords
+            .filter { $0.id != record.id && $0.contentFingerprint == record.contentFingerprint }
+            .map(\.url)
+            .sorted { $0.absoluteString < $1.absoluteString }
+    }
+
     private func sourcePages(for record: CrawlRecord) -> [URL] {
         let candidates = Set(record.foundOnURLs.filter { $0 != record.url })
         guard isRedirectMetric, !record.redirectSources.isEmpty else {
@@ -807,6 +819,16 @@ private struct AffectedCrawlRecordList: View {
                         if isWordPressTechnicalHeadMetric {
                             ForEach(record.wordPressHeadFindings, id: \.self) { finding in
                                 Text(finding)
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(3)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        if isDuplicateContentMetric {
+                            let matches = duplicatePages(for: record)
+                            if !matches.isEmpty {
+                                Text("Same extracted main content as: \(matches.map(\.absoluteString).joined(separator: ", "))")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                                     .lineLimit(3)
@@ -995,6 +1017,7 @@ struct ProblemExampleList: View {
     private var isEmbeddedImageProblem: Bool { isImageAltProblem || problemName == "Images over 100 KB" || problemName == "Over 100 KB" }
     private var isImageResourceProblem: Bool { problemName == "Broken image resources" || problemName == "Heavy image resources" || problemName == "Broken Image Resources" || problemName == "Heavy Image Resources" }
     private var isRedirectProblem: Bool { problemName.localizedCaseInsensitiveContains("redirect") }
+    private var isDuplicateContentProblem: Bool { problemName.localizedCaseInsensitiveContains("duplicate content") }
     private var isWordPressTechnicalHeadProblem: Bool { problemName.localizedCaseInsensitiveContains("technical head") }
     private var isPageMetricsProblem: Bool { problemName.localizedCaseInsensitiveContains("page weight") || problemName.localizedCaseInsensitiveContains("ai:") }
     private var isSchemaProblem: Bool { problemName.localizedCaseInsensitiveContains("schema") || problemName.localizedCaseInsensitiveContains("structured data") || ["Organization / Business", "BreadcrumbList", "Product", "Review", "FAQPage", "WebSite", "WebPage", "Service", "Person", "VideoObject", "Event", "JobPosting"].contains(problemName) }
@@ -1015,7 +1038,7 @@ struct ProblemExampleList: View {
                             Text(record.url.absoluteString).lineLimit(2).textSelection(.enabled)
                             Spacer()
                             URLActions(url: record.url)
-                            if !isWordPressTechnicalHeadProblem && !record.foundOnURLs.isEmpty {
+                            if !isWordPressTechnicalHeadProblem && !isDuplicateContentProblem && !record.foundOnURLs.isEmpty {
                                 Button {
                                     if expandedFoundOn.contains(record.id) { expandedFoundOn.remove(record.id) }
                                     else { expandedFoundOn.insert(record.id) }
@@ -1027,13 +1050,18 @@ struct ProblemExampleList: View {
                             }
                         }
                         if isSchemaProblem { Text(record.schemaTypes.isEmpty ? "JSON-LD schema not found" : "JSON-LD: \(record.schemaTypes.joined(separator: ", "))").lineLimit(3).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                        else if isDuplicateContentProblem {
+                            let matches = records.filter { $0.id != record.id && !$0.contentFingerprint.isEmpty && $0.contentFingerprint == record.contentFingerprint }.map(\.url.absoluteString).sorted()
+                            Text(matches.isEmpty ? "No matching page retained in this issue." : "Same extracted main content as: \(matches.joined(separator: ", "))")
+                                .lineLimit(4).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                        }
                         else if isWordPressTechnicalHeadProblem { Text(record.wordPressHeadFindings.joined(separator: " · ")).lineLimit(4).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
                         else if isRedirectProblem, let source = record.redirectSources.first { Text("Redirect: \(source.absoluteString) → \(record.url.absoluteString)").lineLimit(3).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
                         else if isTitleProblem { Text(record.title.isEmpty ? "Title is missing" : record.title).lineLimit(3).textSelection(.enabled); Text("Title length: \(record.title.count) characters").font(.caption).foregroundStyle(.secondary) }
                         else if isImageResourceProblem { HStack(spacing: 8) { Text(record.statusText); Text(record.transportLabel); Text(record.contentType); if record.size > 0 { Text(ByteCountFormatter.string(fromByteCount: Int64(record.size), countStyle: .file)) } }.font(.caption).foregroundStyle(record.statusCode.map { $0 >= 400 } == true ? .red : .secondary) }
                         else if isPageMetricsProblem { PageMetricsCompactLine(record: record) }
                         else { HStack(spacing: 8) { Text(record.statusText); Text(record.transportLabel).foregroundStyle(record.transportUsed == "cdp" ? .blue : .secondary); if !record.title.isEmpty { Text(record.title).lineLimit(1) } }.font(.caption).foregroundStyle(.secondary) }
-                        if !isPageMetricsProblem && !isWordPressTechnicalHeadProblem && expandedFoundOn.contains(record.id) { FoundOnLinks(urls: record.foundOnURLs) }
+                        if !isPageMetricsProblem && !isWordPressTechnicalHeadProblem && !isDuplicateContentProblem && expandedFoundOn.contains(record.id) { FoundOnLinks(urls: record.foundOnURLs) }
                     }.contextMenu { Button("Open in browser") { NSWorkspace.shared.open(record.url) }; Button("Copy URL") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(record.url.absoluteString, forType: .string) } }
                 }
             }

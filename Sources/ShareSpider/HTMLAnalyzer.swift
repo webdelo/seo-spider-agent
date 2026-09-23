@@ -95,17 +95,32 @@ enum HTMLAnalyzer {
             .max(by: { $0.count < $1.count })
             ?? contentBlocks.compactMap { try? $0.text() }.max(by: { $0.count < $1.count })
 
-        // Not every CMS uses semantic landmarks. In that case, use the H1's
-        // sibling section — all H2/H3 subsections remain part of the page;
-        // only a following H1 starts a new independent section.
+        // Not every CMS uses semantic landmarks. An H1 can live in a separate
+        // hero with an introduction, while the article continues in the next
+        // sibling sections. Start with that introductory container, then take
+        // its following content sections. H2/H3 remain part of the material;
+        // only a new H1 or a page chrome landmark ends the section.
         func headingSectionText() -> String? {
             guard let heading = primaryHeading else { return nil }
-            var parts: [String] = []
-            var current = try? heading.nextElementSibling()
+            let intro = heading.parent() ?? heading
+            var parts = [(try? intro.text()) ?? ""]
+            var current = try? intro.nextElementSibling()
             while let element = current {
-                if element.tagName().lowercased() == "h1" { break }
+                let tag = element.tagName().lowercased()
+                if ["footer", "nav", "aside"].contains(tag) || ((try? element.select("h1").count) ?? 0) > 0 { break }
                 if let text = try? element.text(), !text.isEmpty { parts.append(text) }
                 current = try? element.nextElementSibling()
+            }
+            // Some templates put the H1 and paragraphs directly under one
+            // wrapper. If there were no useful section siblings, use those
+            // direct following elements rather than returning an empty value.
+            if parts.joined(separator: " ").split(whereSeparator: { $0.isWhitespace }).count < 80 {
+                current = try? heading.nextElementSibling()
+                while let element = current {
+                    if element.tagName().lowercased() == "h1" { break }
+                    if let text = try? element.text(), !text.isEmpty { parts.append(text) }
+                    current = try? element.nextElementSibling()
+                }
             }
             let text = parts.joined(separator: " ")
             return text.isEmpty ? nil : text

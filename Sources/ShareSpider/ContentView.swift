@@ -1358,6 +1358,7 @@ struct BacklinksView: View {
                         ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
                         ubersuggestSpamDomains: Set(model.ubersuggestBacklinkImport?.spamDomains ?? []),
                         searchConsole: Set(model.gscBacklinkImport?.donors.map(\.sourceDomain) ?? []),
+                        searchConsoleDetails: model.gscBacklinkImport?.donors ?? [],
                         site: model.startText,
                         loadDataForSEO: model.loadBacklinkSourceAnalysis,
                         loadAhrefs: model.loadAhrefsReferringDomains,
@@ -1425,6 +1426,7 @@ struct BacklinksView: View {
                 ubersuggest: Set(model.ubersuggestBacklinkImport?.domains ?? []),
                 ubersuggestSpamDomains: Set(model.ubersuggestBacklinkImport?.spamDomains ?? []),
                 searchConsole: Set(model.gscBacklinkImport?.donors.map(\.sourceDomain) ?? []),
+                searchConsoleDetails: model.gscBacklinkImport?.donors ?? [],
                 site: model.startText,
                 loadDataForSEO: model.loadBacklinkSourceAnalysis,
                 loadAhrefs: model.loadAhrefsReferringDomains,
@@ -1673,6 +1675,7 @@ private struct BacklinkComparisonDashboard: View {
     let ubersuggest: Set<String>
     let ubersuggestSpamDomains: Set<String>
     let searchConsole: Set<String>
+    let searchConsoleDetails: [GSCBacklinkDonor]
     let site: String
     let loadDataForSEO: () -> Void
     let loadAhrefs: () -> Void
@@ -1713,6 +1716,7 @@ private struct BacklinkComparisonDashboard: View {
                         ubersuggest: ubersuggest,
                         ubersuggestSpamDomains: ubersuggestSpamDomains,
                         searchConsole: searchConsole,
+                        searchConsoleDetails: searchConsoleDetails,
                         site: site
                     )
                 }
@@ -1755,6 +1759,15 @@ private struct ReferringDomainSourceRow: Identifiable {
     let inUbersuggest: Bool
     let inSearchConsole: Bool
     var id: String { domain }
+
+    var providers: String {
+        var values: [String] = []
+        if inAhrefs { values.append("Ahrefs") }
+        if inUbersuggest { values.append("Ubersuggest") }
+        if inDataForSEO { values.append("DataForSEO") }
+        if inSearchConsole { values.append("Search Console") }
+        return values.joined(separator: ", ")
+    }
 }
 
 /// One auditable row per unique donor. The provider marks show discovery, not
@@ -1770,6 +1783,7 @@ private struct ReferringDomainSourceTable: View {
     let ubersuggest: Set<String>
     let ubersuggestSpamDomains: Set<String>
     let searchConsole: Set<String>
+    let searchConsoleDetails: [GSCBacklinkDonor]
     let site: String
 
     private var detailsByDomain: [String: [BacklinkSourceDetail]] {
@@ -1786,6 +1800,12 @@ private struct ReferringDomainSourceTable: View {
         Set(ubersuggestSpamDomains.map(GSCBacklinkImportService.normalizedDomain))
     }
 
+    private var searchConsoleDetailsByDomain: [String: [GSCBacklinkDonor]] {
+        Dictionary(grouping: searchConsoleDetails) {
+            GSCBacklinkImportService.normalizedDomain($0.sourceDomain)
+        }
+    }
+
     private func anchorSummary(for domain: String) -> String {
         let anchors = detailsByDomain[domain, default: []]
             .map { $0.anchor.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1798,8 +1818,10 @@ private struct ReferringDomainSourceTable: View {
 
     private func detailURLs(for domain: String) -> [String] {
         var seen = Set<String>()
-        return detailsByDomain[domain, default: []]
-            .map { $0.sourceURL.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let dataForSEOURLs = detailsByDomain[domain, default: []].map(\.sourceURL)
+        let searchConsoleURLs = searchConsoleDetailsByDomain[domain, default: []].map(\.sourceURL)
+        return (dataForSEOURLs + searchConsoleURLs)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && seen.insert($0).inserted }
             .sorted()
     }
@@ -1879,8 +1901,9 @@ private struct ReferringDomainSourceTable: View {
             let statuses = [details.contains(where: { !$0.isLost }) ? "Active" : nil, details.contains(where: \.isLost) ? "Lost" : nil].compactMap { $0 }.joined(separator: " | ")
             let isBroken = details.contains { $0.broken || $0.sourceStatusCode >= 400 }
             return [
+                row.providers,
                 row.domain,
-                row.detailURLs.joined(separator: " | "),
+                row.detailURLs.isEmpty ? "Not provided (domain-level data)" : row.detailURLs.joined(separator: " | "),
                 row.ahrefsDR.map { String(format: "%.1f", $0) } ?? "",
                 row.dataForSEORank.map(String.init) ?? "",
                 row.anchors == "—" ? "" : row.anchors,
@@ -1898,7 +1921,7 @@ private struct ReferringDomainSourceTable: View {
     private func exportComparison() {
         URLListTransfer.export(
             name: "Referring-Domain-Comparison",
-            header: ["Domain", "Detailed source URLs", "Ahrefs DR", "DataForSEO DR", "Anchors", "Page type", "Known status", "Broken", "Ahrefs", "DataForSEO", "Ubersuggest", "Search Console"],
+            header: ["Data providers", "Domain", "Detailed source URLs", "Ahrefs DR", "DataForSEO DR", "Anchors", "Page type", "Known status", "Broken", "Ahrefs", "DataForSEO", "Ubersuggest", "Search Console"],
             rows: exportRows,
             site: site
         )
@@ -1918,7 +1941,13 @@ private struct ReferringDomainSourceTable: View {
                     }
                     .disabled(rows.isEmpty)
                 }
+                Text("Exact source-page URLs appear only when a provider returns page-level records. Ahrefs refdomains, Ubersuggest domain imports and GSC Top linking sites are domain-level datasets; their detailed URL is marked as unavailable instead of being guessed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Table(rows) {
+                    TableColumn("Data provider") { row in
+                        Text(row.providers).lineLimit(2).help(row.providers)
+                    }.width(min: 130, ideal: 180)
                     TableColumn("Domain") { row in
                         HStack(spacing: 7) {
                             Text(row.domain).lineLimit(1).textSelection(.enabled)
